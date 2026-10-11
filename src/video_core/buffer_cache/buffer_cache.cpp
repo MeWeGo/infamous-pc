@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <bit>
 #include <magic_enum/magic_enum.hpp>
 
 #include "common/alignment.h"
 #include "common/perf_profiler.h"
 #include "common/polyfill_thread.h"
 #include "common/thread.h"
+#include "common/tuning.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -35,10 +37,17 @@ static constexpr u64 RESIDENCY_GRANULE_SIZE = 16_MB;
 static constexpr u64 RESIDENCY_CHUNK_SIZE = 256_MB;
 // Memory game threads read back is copied back ahead of them for this long after they last
 // faulted on it, for at most this many windows of it.
-static constexpr auto HotWindowLife = std::chrono::seconds{5};
+static std::chrono::seconds HotWindowLife() {
+    static const auto life = std::chrono::seconds{Common::Tune("SHAD_HOT_WINDOW_SECS", 5)};
+    return life;
+}
 static constexpr size_t MaxHotWindows = 64;
 // A window whose copies ahead go stale is skipped for up to this many chances to copy it.
-static constexpr u8 MaxPrefetchBackoff = 7;
+static u8 MaxPrefetchBackoff() {
+    static const u8 backoff =
+        static_cast<u8>(std::min<u64>(Common::Tune("SHAD_PREFETCH_BACKOFF_MAX", 7), 255));
+    return backoff;
+}
 
 static constexpr auto ARENA_USAGE =
     vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eTransferDst |
@@ -197,7 +206,8 @@ std::tuple<const Buffer*, VAddr, VAddr> BufferCache::GetReadbackWindow(VAddr dev
 
     // GPU-modified ranges come as many small scattered islands,
     // so the download is widened to a window around the request
-    constexpr u64 WindowSize = 512_KB;
+    static const u64 WindowSize =
+        std::bit_floor(std::max<u64>(Common::Tune("SHAD_READBACK_WINDOW_KB", 512), 4) * 1_KB);
     const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
     const VAddr window_start =
         std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
@@ -353,15 +363,17 @@ std::shared_ptr<BufferCache::Readback> BufferCache::RecordReadback(const Buffer*
 
 void BufferCache::PrefetchReadbacks() {
     ApplyFinishedReadbacks();
-    if (hot_windows.empty()) {
+    static const bool prefetch_off = Common::Tune("SHAD_PREFETCH_OFF", 0) != 0;
+    if (prefetch_off || hot_windows.empty()) {
         return;
     }
     // The game is about to read results of the work it was just told is done. Copying the
     // memory it read back recently now, behind that work, means it is mostly written back by
     // the time the game touches it, so its threads neither fault on it nor wait for the GPU.
     const auto now = std::chrono::steady_clock::now();
-    std::erase_if(hot_windows,
-                  [&](const HotWindow& window) { return now - window.last_fault > HotWindowLife; });
+    std::erase_if(hot_windows, [&](const HotWindow& window) {
+        return now - window.last_fault > HotWindowLife();
+    });
     // Gathered once, as this runs on every fence and checked each window against every copy.
     boost::container::small_vector<std::pair<VAddr, VAddr>, 32> in_flight_ranges;
     for (const auto& readback : readbacks) {
@@ -558,7 +570,7 @@ void BufferCache::RatePrefetch(Readback& readback, bool useful) {
     if (useful) {
         hot->backoff = 0;
     } else {
-        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff);
+        hot->backoff = std::min<u8>(static_cast<u8>(hot->backoff * 2 + 1), MaxPrefetchBackoff());
         hot->skip = hot->backoff;
     }
 }
