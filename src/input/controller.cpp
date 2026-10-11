@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <mutex>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -206,6 +208,24 @@ void GameController::SetTouchpadState(int touch_index, bool touch_down, float x,
         m_touch_down_timestamp = 0;
     }
     PushStateLocked(timestamp);
+}
+
+void GameController::SwipeTouchpad(float from_x, float from_y, float to_x, float to_y) {
+    // Games read the touchpad every frame, so the finger has to move for a few of them to see
+    // a swipe rather than a tap: about 160 ms in steps short enough to land in each frame.
+    static constexpr int Steps = 16;
+    static constexpr auto StepTime = std::chrono::milliseconds{10};
+    std::lock_guard lock{m_swipe_mutex};
+    // Replacing the thread asks the one going on to stop, which lifts its finger, and waits.
+    m_swipe_thread = std::jthread([this, from_x, from_y, to_x, to_y](std::stop_token token) {
+        SetTouchpadState(0, true, from_x, from_y);
+        for (int step = 1; step <= Steps && !token.stop_requested(); ++step) {
+            std::this_thread::sleep_for(StepTime);
+            const float t = static_cast<float>(step) / Steps;
+            SetTouchpadState(0, true, from_x + (to_x - from_x) * t, from_y + (to_y - from_y) * t);
+        }
+        SetTouchpadState(0, false, to_x, to_y);
+    });
 }
 
 void GameController::ConnectController(SDL_Gamepad* pad) {

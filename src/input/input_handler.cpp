@@ -754,6 +754,26 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             controller->SetTouchpadState(0, new_button_state, 0.75f, 0.5f);
             controller->Button(SDLGamepadToOrbisButton(button), new_button_state);
             break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.85f, 0.5f, 0.15f, 0.5f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_RIGHT:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.15f, 0.5f, 0.85f, 0.5f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_UP:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.85f, 0.5f, 0.15f);
+            }
+            break;
+        case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_DOWN:
+            if (new_button_state) {
+                controller->SwipeTouchpad(0.5f, 0.15f, 0.5f, 0.85f);
+            }
+            break;
         case LEFTJOYSTICK_HALFMODE:
             leftjoystick_halfmode = new_button_state;
             break;
