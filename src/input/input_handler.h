@@ -37,6 +37,10 @@
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_RIGHT (SDL_GAMEPAD_BUTTON_COUNT + 9)
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_UP (SDL_GAMEPAD_BUTTON_COUNT + 10)
 #define SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_DOWN (SDL_GAMEPAD_BUTTON_COUNT + 11)
+// While held, a stick moves a finger on the touchpad (left stick the first, right stick the
+// second) instead of moving the character or camera, for swipes in any direction.
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1 (SDL_GAMEPAD_BUTTON_COUNT + 12)
+#define SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER2 (SDL_GAMEPAD_BUTTON_COUNT + 13)
 
 #define SDL_EVENT_TOGGLE_FULLSCREEN SDL_EVENT_USER + 1
 #define SDL_EVENT_TOGGLE_PAUSE SDL_EVENT_USER + 2
@@ -161,6 +165,8 @@ const std::map<std::string, u32> string_to_cbutton_map = {
     {"touchpad_swipe2_right", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_RIGHT},
     {"touchpad_swipe2_up", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_UP},
     {"touchpad_swipe2_down", SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE2_DOWN},
+    {"touchpad_finger1", SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1},
+    {"touchpad_finger2", SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER2},
     {"leftjoystick_halfmode", LEFTJOYSTICK_HALFMODE},
     {"rightjoystick_halfmode", RIGHTJOYSTICK_HALFMODE},
     {"motion_tilt_left", MOTION_TILT_LEFT},
@@ -564,11 +570,14 @@ public:
 
 class ControllerAllOutputs {
 public:
-    static constexpr u64 output_count = 54;
+    static constexpr u64 output_count = 56;
     std::array<ControllerOutput, output_count> data = {
         // Important: these have to be the first, or else they will update in the wrong order
         ControllerOutput(LEFTJOYSTICK_HALFMODE),
         ControllerOutput(RIGHTJOYSTICK_HALFMODE),
+        // These change what the stick outputs do, so they too have to update before the sticks
+        ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1),
+        ControllerOutput(SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER2),
         ControllerOutput(KEY_TOGGLE),
         ControllerOutput(MOUSE_GYRO_ROLL_MODE),
 
