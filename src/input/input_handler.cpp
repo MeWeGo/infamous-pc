@@ -771,6 +771,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
             break;
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_SWIPE_LEFT:
             if (new_button_state) {
+                LOG_INFO(Input, "touchpad swipe output fired");
                 controller->SwipeTouchpad(0.85f, 0.5f, 0.15f, 0.5f);
             }
             break;
@@ -812,6 +813,7 @@ void ControllerOutput::FinalizeUpdate(u8 gamepad_index) {
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1:
         case SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER2: {
             const int finger = button == SDL_GAMEPAD_BUTTON_TOUCHPAD_FINGER1 ? 0 : 1;
+            LOG_INFO(Input, "touchpad finger {} {}", finger + 1, new_button_state ? "down" : "up");
             touch_finger_mode[finger] = new_button_state;
             touch_finger_stick[finger][0] = touch_finger_stick[finger][1] = 0;
             controller->SetTouchpadState(finger, new_button_state, TouchFingerCenterX[finger],
