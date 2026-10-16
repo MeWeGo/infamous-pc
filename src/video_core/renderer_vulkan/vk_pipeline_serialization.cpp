@@ -26,7 +26,7 @@ namespace {
 // and is changed to the next such build whenever it changes again. Keying the cache to every
 // build dropped it with each update, and some games compile hundreds of compute shaders while
 // they are played, at up to a few hundred milliseconds each.
-constexpr std::string_view ShaderCacheRevision = "ee42372657621d64d517c066659054812a90e572";
+constexpr std::string_view ShaderCacheRevision = "infamous-fixbuild-anyps5-v1";
 } // Anonymous namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
@@ -385,7 +385,14 @@ void PipelineCache::WarmUp() {
             }
         });
 
-    LOG_INFO(Render, "Preloaded {} pipelines", num_pipelines);
+    for (const auto& [_, pipeline] : compute_pipelines) {
+        pipeline->WaitReady();
+    }
+    for (const auto& [_, pipeline] : graphics_pipelines) {
+        pipeline->WaitReady();
+    }
+
+    LOG_INFO(Render, "Preloaded {} pipelines (all compiled and resident in VRAM)", num_pipelines);
     if (num_total_pipelines > num_pipelines) {
         LOG_WARNING(Render, "{} stale pipelines were found. Consider re-generating the cache",
                     num_total_pipelines - num_pipelines);
@@ -395,6 +402,7 @@ void PipelineCache::WarmUp() {
 }
 
 void PipelineCache::Sync() {
+    SaveDriverCache();
     Storage::DataBase::Instance().Close();
 }
 

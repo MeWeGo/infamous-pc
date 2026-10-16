@@ -192,6 +192,10 @@ void CFG::SplitDivergenceScopes() {
             if ((is_close || index == blk->end_index) && curr_begin != -1) {
                 // If there are no instructions inside scope don't do anything.
                 if (index - curr_begin == 1 && is_close) {
+                    if (is_open_scope(inst)) {
+                        curr_begin = static_cast<s32>(index);
+                        continue;
+                    }
                     curr_begin = -1;
                     continue;
                 }

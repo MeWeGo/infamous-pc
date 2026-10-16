@@ -131,6 +131,7 @@ struct Program {
 struct DrawIndirectParams {
     u16 vertex_sgpr_offset;
     u32 instance_sgpr_offset;
+    bool is_indirect{};
 };
 
 class PipelineCache {
@@ -141,6 +142,7 @@ public:
 
     void WarmUp();
     void Sync();
+    bool SaveDriverCache();
 
     bool LoadComputePipeline(Serialization::Archive& ar);
     bool LoadGraphicsPipeline(Serialization::Archive& ar);
@@ -185,6 +187,11 @@ private:
         return num_new_pipelines > 0;
     }
 
+    struct DriverCacheSaver;
+    bool SaveDriverCacheUnchecked();
+    void StartDriverCacheSaver();
+    void StopDriverCacheSaver();
+
 private:
     const Instance& instance;
     Scheduler& scheduler;
@@ -192,6 +199,7 @@ private:
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
+    DriverCacheSaver* driver_saver{};
     Shader::Profile profile{};
     Shader::Pools pools;
     DrawIndirectParams draw_indirect_params{};

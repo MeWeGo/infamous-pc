@@ -430,6 +430,8 @@ void DefineEntryPoint(const Info& info, EmitContext& ctx, Id main) {
         }
         if (info.stores.GetAny(IR::Attribute::Depth)) {
             ctx.AddExecutionMode(main, spv::ExecutionMode::DepthReplacing);
+        } else if (ctx.runtime_info.hw.fs.depth_before_shader) {
+            ctx.AddExecutionMode(main, spv::ExecutionMode::EarlyFragmentTests);
         }
         break;
     case SwStage::Geometry:

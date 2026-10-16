@@ -112,13 +112,20 @@ void Translator::EmitPrologue(IR::Block* first_block) {
 
         // v0: vertex ID, always present
         IR::U32 vertex_id = ir.GetAttributeU32(IR::Attribute::VertexId);
+        bool unbias_vertex = false;
         if (base_vertex_sgpr != -1) {
             if (!fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1) {
-                vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
+                unbias_vertex = true;
             } else {
                 ASSERT_MSG(fetch_data.vertex_offset_sgpr == base_vertex_sgpr,
                            "Fetch shader in indirect draw uses wrong base vertex");
             }
+        } else if (runtime_info.sw.vs.is_indirect &&
+                   (fetch_data.Empty() || fetch_data.vertex_offset_sgpr == -1)) {
+            unbias_vertex = true;
+        }
+        if (unbias_vertex) {
+            vertex_id = ir.ISub(vertex_id, ir.GetAttributeU32(IR::Attribute::BaseVertex));
         }
         ir.SetVectorReg(dst_vreg++, vertex_id);
 
@@ -157,14 +164,20 @@ void Translator::EmitPrologue(IR::Block* first_block) {
         // v3: instance ID, plain
         if (runtime_info.props.num_input_vgprs > 2) {
             IR::U32 instance_id = ir.GetAttributeU32(IR::Attribute::InstanceId);
+            bool unbias_instance = false;
             if (base_instance_sgpr != -1) {
                 if (!fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1) {
-                    instance_id =
-                        ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
+                    unbias_instance = true;
                 } else {
                     ASSERT_MSG(fetch_data.instance_offset_sgpr == base_instance_sgpr,
                                "Fetch shader in indirect draw uses wrong base instance");
                 }
+            } else if (runtime_info.sw.vs.is_indirect &&
+                       (fetch_data.Empty() || fetch_data.instance_offset_sgpr == -1)) {
+                unbias_instance = true;
+            }
+            if (unbias_instance) {
+                instance_id = ir.ISub(instance_id, ir.GetAttributeU32(IR::Attribute::BaseInstance));
             }
             ir.SetVectorReg(dst_vreg++, instance_id);
         }

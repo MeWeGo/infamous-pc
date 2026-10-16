@@ -4,9 +4,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <ranges>
+#include <thread>
 
+#include "common/elf_info.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -179,6 +183,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
                 ? regs.aa_config.NumSamples()
                 : 1;
         info.hw.fs.z_export_format = regs.z_export_format;
+        info.hw.fs.depth_before_shader = regs.depth_shader_control.depth_before_shader;
         u8 stencil_ref_export_enable = regs.depth_shader_control.stencil_op_val_export_enable |
                                        regs.depth_shader_control.stencil_test_val_export_enable;
         info.hw.fs.mrtz_mask = regs.depth_shader_control.z_export_enable |
@@ -247,6 +252,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         info.sw.vs.step_rate_1 = regs.vgt_instance_step_rate_1;
         info.sw.vs.vertex_sgpr_offset = draw_indirect_params.vertex_sgpr_offset;
         info.sw.vs.instance_sgpr_offset = draw_indirect_params.instance_sgpr_offset;
+        info.sw.vs.is_indirect = draw_indirect_params.is_indirect;
         info.sw.vs.tess_emulated_primitive =
             regs.primitive_type == AmdGpu::PrimitiveType::RectList ||
             regs.primitive_type == AmdGpu::PrimitiveType::QuadList;
@@ -269,6 +275,54 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
     }
     return info;
 }
+
+namespace {
+
+std::filesystem::path DriverCachePath(const Instance& instance) {
+    using namespace Common::FS;
+    const auto props = instance.GetPhysicalDevice().getProperties();
+    std::string uuid_hex;
+    uuid_hex.reserve(VK_UUID_SIZE * 2);
+    for (u8 b : props.pipelineCacheUUID) {
+        uuid_hex += fmt::format("{:02x}", b);
+    }
+    const auto& serial = Common::ElfInfo::Instance().GameSerial();
+    const auto dir_name = serial.empty() ? std::string{"driver"} : fmt::format("driver-{}", serial);
+    const auto dir = GetUserPath(PathType::CacheDir) / dir_name;
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return dir / fmt::format("vk_pipeline_cache_{:04x}_{:04x}_{}.vkc", props.vendorID,
+                             props.deviceID, uuid_hex);
+}
+
+std::vector<u8> LoadDriverCacheBlob(const Instance& instance) {
+    using namespace Common::FS;
+    const auto path = DriverCachePath(instance);
+    if (!std::filesystem::exists(path)) {
+        return {};
+    }
+    IOFile file{path, FileAccessMode::Read};
+    if (!file.IsOpen() || file.GetSize() < sizeof(vk::PipelineCacheHeaderVersionOne)) {
+        return {};
+    }
+    std::vector<u8> blob(file.GetSize());
+    if (file.ReadRaw<u8>(blob.data(), blob.size()) != blob.size()) {
+        return {};
+    }
+    LOG_INFO(Render_Vulkan, "Loaded driver VkPipelineCache ({} KB) from {}", blob.size() / 1024,
+             path.string());
+    return blob;
+}
+
+} // namespace
+
+struct PipelineCache::DriverCacheSaver {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool stop{false};
+    u64 last_hash{0};
+    std::thread worker;
+};
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
                              AmdGpu::Liverpool* liverpool_, u32 sparse_page_shift)
@@ -330,7 +384,12 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
         .supports_shader_stencil_export = instance_.IsShaderStencilExportSupported(),
     };
 
-    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique({});
+    const auto driver_blob = LoadDriverCacheBlob(instance);
+    const vk::PipelineCacheCreateInfo cache_ci{
+        .initialDataSize = driver_blob.size(),
+        .pInitialData = driver_blob.empty() ? nullptr : driver_blob.data(),
+    };
+    auto [cache_result, cache] = instance.GetDevice().createPipelineCacheUnique(cache_ci);
     ASSERT_MSG(cache_result == vk::Result::eSuccess, "Failed to create pipeline cache: {}",
                vk::to_string(cache_result));
     pipeline_cache = std::move(cache);
@@ -341,9 +400,91 @@ PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
              compiler->NumWorkers(), async_shader_compile);
 
     WarmUp();
+    SaveDriverCache();
+    StartDriverCacheSaver();
 }
 
-PipelineCache::~PipelineCache() = default;
+PipelineCache::~PipelineCache() {
+    StopDriverCacheSaver();
+    SaveDriverCache();
+}
+
+bool PipelineCache::SaveDriverCacheUnchecked() {
+    if (!pipeline_cache) {
+        return false;
+    }
+    auto [res, blob] = instance.GetDevice().getPipelineCacheData(*pipeline_cache);
+    if (res != vk::Result::eSuccess || blob.empty()) {
+        return false;
+    }
+    const u64 h = std::hash<std::string_view>{}(
+        std::string_view{reinterpret_cast<const char*>(blob.data()), blob.size()});
+    if (driver_saver && driver_saver->last_hash == h) {
+        return false;
+    }
+    using namespace Common::FS;
+    const auto path = DriverCachePath(instance);
+    auto tmp_path = path;
+    tmp_path += ".tmp";
+    {
+        IOFile file{tmp_path, FileAccessMode::Create};
+        if (!file.IsOpen() || file.WriteRaw<u8>(blob.data(), blob.size()) != blob.size()) {
+            return false;
+        }
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp_path, path, ec);
+    if (ec) {
+        std::filesystem::copy_file(tmp_path, path,
+                                   std::filesystem::copy_options::overwrite_existing, ec);
+        std::filesystem::remove(tmp_path, ec);
+    }
+    if (driver_saver) {
+        driver_saver->last_hash = h;
+    }
+    LOG_INFO(Render_Vulkan, "Saved driver VkPipelineCache ({} KB) to {}", blob.size() / 1024,
+             path.string());
+    return true;
+}
+
+bool PipelineCache::SaveDriverCache() {
+    if (!driver_saver) {
+        return SaveDriverCacheUnchecked();
+    }
+    std::unique_lock lk{driver_saver->mutex};
+    return SaveDriverCacheUnchecked();
+}
+
+void PipelineCache::StartDriverCacheSaver() {
+    driver_saver = new DriverCacheSaver{};
+    driver_saver->worker = std::thread([this] {
+        std::unique_lock lk{driver_saver->mutex};
+        while (!driver_saver->stop) {
+            driver_saver->cv.wait_for(lk, std::chrono::seconds(60),
+                                      [this] { return driver_saver->stop; });
+            if (driver_saver->stop) {
+                break;
+            }
+            SaveDriverCacheUnchecked();
+        }
+    });
+}
+
+void PipelineCache::StopDriverCacheSaver() {
+    if (!driver_saver) {
+        return;
+    }
+    {
+        std::scoped_lock lk{driver_saver->mutex};
+        driver_saver->stop = true;
+    }
+    driver_saver->cv.notify_all();
+    if (driver_saver->worker.joinable()) {
+        driver_saver->worker.join();
+    }
+    delete driver_saver;
+    driver_saver = nullptr;
+}
 
 const GraphicsPipeline* PipelineCache::GetGraphicsPipeline(const DrawIndirectParams params) {
     draw_indirect_params = params;
@@ -713,8 +854,9 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
         auto& program = it_pgm.value();
         auto start = binding;
+        const auto lookup_runtime_info = runtime_info;
         const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, runtime_info, profile, start);
+        auto spec = Shader::StageSpecialization(program->info, lookup_runtime_info, profile, start);
         const auto perm_hash = HashCombine(params.hash, 0);
 
         RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
@@ -722,6 +864,12 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
             fetch_shader = &fetch;
         }
+        program->FindSharpDwords();
+        const auto* lookup_dwords = program->LookupDwords();
+        auto& last = program->last_lookups[program->next_last_lookup];
+        program->next_last_lookup = (program->next_last_lookup + 1) % Program::NumLastLookups;
+        last.Remember(program->info, lookup_runtime_info, start, 0,
+                      program->modules[0].spec.fetch_shader_data, lookup_dwords);
         return std::make_tuple(&program->info, module, perm_hash);
     }
 
@@ -768,7 +916,8 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     const auto it = std::ranges::find(program->modules, spec, &Program::Module::spec);
     if (it == program->modules.end()) {
         auto new_info = Shader::Info(hw_stage, sw_stage, params);
-        module = CompileModule(new_info, runtime_info, params.code, perm_idx, binding);
+        auto compile_runtime_info = runtime_info;
+        module = CompileModule(new_info, compile_runtime_info, params.code, perm_idx, binding);
 
         RegisterShaderMeta(info, spec.fetch_shader_data, spec, perm_hash, perm_idx);
         program->AddPermut(module, std::move(spec));

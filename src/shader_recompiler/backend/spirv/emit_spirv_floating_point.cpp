@@ -148,13 +148,13 @@ Id EmitFPSqrt(EmitContext& ctx, Id value) {
 Id EmitFPSaturate32(EmitContext& ctx, Id value) {
     const Id zero{ctx.ConstF32(f32{0.0})};
     const Id one{ctx.ConstF32(f32{1.0})};
-    return ctx.OpFClamp(ctx.F32[1], value, zero, one);
+    return ctx.OpNMin(ctx.F32[1], ctx.OpNMax(ctx.F32[1], value, zero), one);
 }
 
 Id EmitFPSaturate64(EmitContext& ctx, Id value) {
     const Id zero{ctx.Constant(ctx.F64[1], f64{0.0})};
     const Id one{ctx.Constant(ctx.F64[1], f64{1.0})};
-    return ctx.OpFClamp(ctx.F64[1], value, zero, one);
+    return ctx.OpNMin(ctx.F64[1], ctx.OpNMax(ctx.F64[1], value, zero), one);
 }
 
 Id EmitFPClamp32(EmitContext& ctx, Id value, Id min_value, Id max_value) {

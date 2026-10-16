@@ -42,5 +42,7 @@ void SharedMemoryBarrierPass(IR::Program& program, const RuntimeInfo& runtime_in
 void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile);
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile);
+bool IsLaneVaryingSource(const IR::Inst& inst);
+std::vector<IR::Block*> FindWave64UniformBlocks(const IR::Program& program);
 
 } // namespace Shader::Optimization
