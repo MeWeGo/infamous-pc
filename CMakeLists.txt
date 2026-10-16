@@ -17,7 +17,7 @@ if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-project(shadPS4 CXX C ASM ${ADDITIONAL_LANGUAGES})
+project(infamous_pc CXX C ASM ${ADDITIONAL_LANGUAGES})
 
 include(FetchContent)
 

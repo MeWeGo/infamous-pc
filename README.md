@@ -5,26 +5,28 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 <h1 align="center">
   <br>
-  <a href="https://shadps4.net/"><img src="https://github.com/shadps4-emu/shadPS4/blob/main/.github/shadps4.png" width="220"></a>
+  <a href="https://github.com/MeWeGo/infamous-pc"><img src="https://github.com/MeWeGo/infamous-pc/blob/main/.github/shadps4.png" width="220"></a>
   <br>
-  <b>shadPS4</b>
+  <b>inFAMOUS High-FPS Custom Build</b>
   <br>
 </h1>
 
 <h1 align="center">
- <a href="https://discord.gg/bFJxfftGW6">
-        <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
- <a href="https://github.com/shadps4-emu/shadPS4/releases/latest">
-        <img src="https://img.shields.io/github/downloads/shadps4-emu/shadPS4/total.svg" width="140">
- <a href="https://shadps4.net/">
-        <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
- <a href="https://x.com/shadps4">
-        <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
- <a href="https://github.com/shadps4-emu/shadPS4/stargazers">
-        <img src="https://img.shields.io/github/stars/shadps4-emu/shadPS4" width="120">
+  <a href="https://discord.gg/bFJxfftGW6">
+         <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
+  <a href="https://github.com/MeWeGo/infamous-pc/releases/latest">
+         <img src="https://img.shields.io/github/downloads/MeWeGo/infamous-pc/total.svg" width="140">
+  <a href="https://shadps4.net/">
+         <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
+  <a href="https://x.com/shadps4">
+         <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
+  <a href="https://github.com/MeWeGo/infamous-pc/stargazers">
+         <img src="https://img.shields.io/github/stars/MeWeGo/infamous-pc" width="120">
 </h1>
 
 # inFAMOUS High-FPS Custom Build
+
+> Fork of [shadPS4](https://github.com/shadps4-emu/shadPS4) focused on **inFAMOUS Second Son** and **inFAMOUS First Light**.
 
 This repository and branch is a custom build of shadPS4 focused on providing dedicated fixes to run **inFAMOUS Second Son** and **inFAMOUS First Light** at high framerates, as well as addressing various graphical issues and color corrections.
 
@@ -113,19 +115,19 @@ This project began for fun. Given our limited free time, it may take some time b
 ## Docker
 
 For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-docker.md)
+[**Docker Build Instructions**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-docker.md)
 
 ## Windows
 
-Check the build instructions for [**Windows**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-windows.md).
+Check the build instructions for [**Windows**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-windows.md).
 
 ## Linux
 
-Check the build instructions for [**Linux**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-linux.md).
+Check the build instructions for [**Linux**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-linux.md).
 
 ## macOS
 
-Check the build instructions for [**macOS**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/building-macos.md).
+Check the build instructions for [**macOS**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-macos.md).
 
 > [!IMPORTANT]
 > macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
@@ -148,7 +150,7 @@ shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game ex
 
 # Debugging and reporting issues
 
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/shadps4-emu/shadPS4/blob/main/documents/Debugging/Debugging.md).
+For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/Debugging/Debugging.md).
 
 # Keyboard and Mouse Mappings
 
@@ -239,13 +241,13 @@ The following firmware modules are supported and must be placed in shadPS4's `sy
 
 Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
 
-<a href="https://github.com/shadps4-emu/shadPS4/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=shadps4-emu/shadPS4&max=24">
+<a href="https://github.com/MeWeGo/infamous-pc/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=MeWeGo/infamous-pc&max=24">
 </a>
 
 # Contributing
 
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/shadps4-emu/shadPS4/blob/main/CONTRIBUTING.md) file.\
+If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/MeWeGo/infamous-pc/blob/main/CONTRIBUTING.md) file.\
 Open a PR and we'll check it :)
 
 
@@ -265,4 +267,4 @@ A few noteworthy teams/projects who've helped us along the way are:
 
 # License
 
-- [**GPL-2.0 license**](https://github.com/shadps4-emu/shadPS4/blob/main/LICENSE)
+- [**GPL-2.0 license**](https://github.com/MeWeGo/infamous-pc/blob/main/LICENSE)
