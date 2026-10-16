@@ -4,9 +4,8 @@
 #pragma once
 
 #include <mutex>
-#include <unordered_set>
-#include <boost/container/small_vector.hpp>
-#include <tsl/robin_map.h>
+#include <absl/container/flat_hash_map.h>
+#include <absl/container/flat_hash_set.h>
 
 #include "common/lru_cache.h"
 #include "common/multi_level_page_table.h"
@@ -32,18 +31,39 @@ class BufferCache;
 class PageManager;
 
 class TextureCache {
-    // Default values for garbage collection
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    /// Cards with a budget up to this get an earlier collector, see the constructor.
+    static constexpr s64 SMALL_CARD_MEMORY = 6_GB;
+    /// Room the collector tries to leave for memory the buffer cache makes resident.
+    static constexpr s64 RESIDENCY_HEADROOM = 1_GB;
 
-    using ImageIds = boost::container::small_vector<ImageId, 16>;
+    struct BucketEntry {
+        u32 key;
+        u32 size;
+        ImageId id;
+
+        bool Overlaps(VAddr addr, size_t size) const noexcept {
+            const VAddr base = Address();
+            return base < (addr + size) && addr < (base + this->size);
+        }
+
+        VAddr Address() const noexcept {
+            return VAddr(key) << 8;
+        }
+    };
+
+    struct alignas(64) Bucket {
+        SmallVector<BucketEntry, 4, u32> entries;
+    };
+    static_assert(sizeof(Bucket) == 64);
 
     struct Traits {
-        using Entry = ImageIds;
+        using Entry = Bucket;
         static constexpr size_t ADDRESS_SPACE_BITS = 40;
         static constexpr size_t L1_BITS = 10;
-        static constexpr size_t PAGE_BITS = 20;
+        static constexpr size_t PAGE_BITS = 18;
         static constexpr bool NULL_CHECK = true;
     };
     using PageTable = Common::MultiLevelPageTable<Traits>;
@@ -76,6 +96,7 @@ public:
         ImageDesc(const Libraries::VideoOut::BufferAttributeGroup& group, VAddr cpu_address)
             : info{group, cpu_address}, type{BindingType::VideoOut} {}
     };
+    static_assert(std::is_trivially_destructible_v<ImageDesc>);
 
 public:
     TextureCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
@@ -102,11 +123,51 @@ public:
     /// Retrieves the image handle of the image with the provided attributes.
     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
 
+    /// Retrieves the image a binding refers to, as FindImage does for the descriptor make_desc
+    /// builds. Building it and finding the image took a good part of every draw, so the
+    /// descriptor it came out as and the image are remembered for the key that make_desc builds
+    /// it from. They are used again until an image is added or removed, which is all that can
+    /// change what FindImage finds for it.
+    template <typename MakeDesc>
+    [[nodiscard]] ImageId FindImageCached(std::span<const u32> key, ImageDesc& desc,
+                                          MakeDesc&& make_desc) {
+        const auto [image_id, found_desc] =
+            FindImageCachedRef(key, std::forward<MakeDesc>(make_desc));
+        desc = *found_desc;
+        return image_id;
+    }
+
+    /// As FindImageCached, but the descriptor is left where the lookup keeps it, and only valid
+    /// until the next lookup. Callers that only need a part of it, like the view of a texture,
+    /// don't have to copy all of it, which was a good part of binding each texture.
+    template <typename MakeDesc>
+    [[nodiscard]] std::pair<ImageId, const ImageDesc*> FindImageCachedRef(std::span<const u32> key,
+                                                                          MakeDesc&& make_desc) {
+        auto& lookup = binding_lookups[HashBindingKey(key) % binding_lookups.size()];
+        if (!UseBindingLookup(lookup, key)) {
+            ImageDesc desc;
+            make_desc(desc);
+            const ImageId image_id = FindImage(desc);
+            RememberBindingLookup(lookup, key, desc, image_id);
+        }
+        return {lookup.image_id, &lookup.desc};
+    }
+
+    /// Changes whenever an image is added or removed, which is all that can change what
+    /// FindImage finds for a descriptor.
+    [[nodiscard]] u64 ImageGeneration() const noexcept {
+        return image_generation;
+    }
+
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+
+    /// As above, for a descriptor of the type and with the view given.
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, BindingType type,
+                                         const ImageViewInfo& view_info);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -116,10 +177,9 @@ public:
 
     /// Updates image contents if it was modified by CPU.
     void UpdateImage(ImageId image_id) {
-        std::scoped_lock lk{mutex};
         Image& image = slot_images[image_id];
-        TrackImage(image_id);
         TouchImage(image);
+        TrackImage(image_id);
         RefreshImage(image);
     }
 
@@ -143,6 +203,13 @@ public:
     [[nodiscard]] vk::Sampler GetSampler(const AmdGpu::Sampler& sampler,
                                          AmdGpu::BorderColorBuffer border_color_base,
                                          bool is_depth);
+
+    /// Bumped whenever the sampler map changes (insert or GC erase), so callers
+    /// memoizing sampler handles can invalidate. Handles from an older generation
+    /// may have been destroyed.
+    [[nodiscard]] u64 SamplerGeneration() const noexcept {
+        return sampler_generation;
+    }
 
     /// Retrieves the image with the specified id.
     [[nodiscard]] Image& GetImage(ImageId id) {
@@ -192,7 +259,7 @@ public:
     bool IsMetaCleared(VAddr address, u32 slice) const {
         const auto& it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            return it.value().clear_mask & (1u << slice);
+            return it->second.clear_mask & (1u << slice);
         }
         return false;
     }
@@ -201,7 +268,7 @@ public:
     bool ClearMeta(VAddr address) {
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
-            it.value().clear_mask = u32(-1);
+            it->second.clear_mask = u32(-1);
             return true;
         }
         return false;
@@ -212,9 +279,9 @@ public:
         auto it = surface_metas.find(address);
         if (it != surface_metas.end()) {
             if (is_clear) {
-                it.value().clear_mask |= 1u << slice;
+                it->second.clear_mask |= 1u << slice;
             } else {
-                it.value().clear_mask &= ~(1u << slice);
+                it->second.clear_mask &= ~(1u << slice);
             }
             return true;
         }
@@ -224,12 +291,40 @@ public:
     /// Runs the garbage collector.
     void RunGarbageCollector();
 
+    /// Frees the images that have not been used for a while, without the collector's limits on how
+    /// many go, for an allocation that failed for lack of device memory. GPU thread. Returns
+    /// whether any image was freed. The memory is released once the GPU is done with the images.
+    bool ReleaseMemoryForAllocation();
+
+    /// Calls func for every image starting at the address that ForEachImageInRegion would report
+    /// for the region, in the same order. Such images are all listed in the page the address is
+    /// in, so unlike ForEachImageInRegion this doesn't walk every page the region covers.
+    template <typename Func>
+    void ForEachImageStartingAt(VAddr cpu_addr, size_t size, Func&& func) {
+        if (size == 0) {
+            return;
+        }
+        auto* const bucket = page_table.find(cpu_addr >> Traits::PAGE_BITS);
+        if (bucket == nullptr) {
+            return;
+        }
+        for (const auto& entry : bucket->entries) {
+            if (entry.Address() != Common::AlignDown(cpu_addr, 256) || entry.size == 0) {
+                continue;
+            }
+            Image& image = slot_images[entry.id];
+            if (image.info.guest_address == cpu_addr) {
+                func(entry.id, image);
+            }
+        }
+    }
+
     template <typename Func>
     void ForEachImageInRegion(VAddr cpu_addr, size_t size, Func&& func) {
         using FuncReturn = typename std::invoke_result<Func, ImageId, Image&>::type;
         static constexpr bool BOOL_BREAK = std::is_same_v<FuncReturn, bool>;
-        ImageIds images;
-        ForEachPage(cpu_addr, size, [this, &images, cpu_addr, size, func](u64 page) {
+        const u64 first_page = cpu_addr >> Traits::PAGE_BITS;
+        ForEachPage(cpu_addr, size, [this, first_page, cpu_addr, size, func](u64 page) {
             const auto it = page_table.find(page);
             if (it == nullptr) {
                 if constexpr (BOOL_BREAK) {
@@ -238,31 +333,27 @@ public:
                     return;
                 }
             }
-            for (const ImageId image_id : *it) {
-                Image& image = slot_images[image_id];
-                if (image.flags & ImageFlagBits::Picked) {
+            for (const auto& entry : it->entries) {
+                const u64 base_page = entry.Address() >> Traits::PAGE_BITS;
+                if (page != std::max(first_page, base_page)) {
                     continue;
                 }
-                if (!image.Overlaps(cpu_addr, size)) {
+                if (!entry.Overlaps(cpu_addr, size)) {
                     continue;
                 }
-                image.flags |= ImageFlagBits::Picked;
-                images.push_back(image_id);
+                Image& image = slot_images[entry.id];
                 if constexpr (BOOL_BREAK) {
-                    if (func(image_id, image)) {
+                    if (func(entry.id, image)) {
                         return true;
                     }
                 } else {
-                    func(image_id, image);
+                    func(entry.id, image);
                 }
             }
             if constexpr (BOOL_BREAK) {
                 return false;
             }
         });
-        for (const ImageId image_id : images) {
-            slot_images[image_id].flags &= ~ImageFlagBits::Picked;
-        }
     }
 
 private:
@@ -285,12 +376,6 @@ private:
     /// Copies image memory back to CPU.
     void DownloadImageMemory(ImageId image_id, bool sync = false);
 
-    /// Thread function for copying downloaded images out to CPU memory.
-    void DownloadedImagesThread(const std::stop_token& token);
-
-    /// Create an image from the given parameters
-    [[nodiscard]] ImageId InsertImage(const ImageInfo& info, VAddr cpu_addr);
-
     /// Register image in the page table
     void RegisterImage(ImageId image);
 
@@ -299,8 +384,6 @@ private:
 
     /// Track CPU reads and writes for image
     void TrackImage(ImageId image_id);
-    void TrackImageHead(ImageId image_id);
-    void TrackImageTail(ImageId image_id);
 
     /// Stop tracking CPU reads and writes for image
     void UntrackImage(ImageId image_id);
@@ -313,15 +396,45 @@ private:
     void DeleteImage(ImageId image_id);
 
     /// Touch the image in the LRU cache.
-    void TouchImage(const Image& image);
+    void TouchImage(Image& image) {
+        image_lru_cache.Touch(image, gc_tick);
+    }
 
+    /// Removes image from the cache and schedules it for deletion.
     void FreeImage(ImageId image_id) {
-        UntrackImage(image_id);
+        {
+            std::scoped_lock lk{slot_images[image_id].mutex};
+            UntrackImage(image_id);
+        }
         UnregisterImage(image_id);
         DeleteImage(image_id);
     }
 
     void GarbageCollectImages();
+
+    static constexpr size_t MaxBindingKeyDwords = 24;
+    static constexpr size_t NumBindingLookups = 2048;
+
+    /// What a binding's key found, see FindImageCached.
+    struct BindingLookup {
+        std::array<u32, MaxBindingKeyDwords> key{};
+        size_t key_size{};
+        /// The image_generation it was found in, 0 for none.
+        u64 generation{};
+        ImageId image_id{};
+        ImageDesc desc{};
+    };
+
+    static u64 HashBindingKey(std::span<const u32> key);
+
+    /// Returns true if the lookup is for the key and still valid, marking its image as used.
+    bool UseBindingLookup(BindingLookup& lookup, std::span<const u32> key);
+
+    void RememberBindingLookup(BindingLookup& lookup, std::span<const u32> key,
+                               const ImageDesc& desc, ImageId image_id);
+
+    /// Frees images that went unused for a while once their slots start running out.
+    void CollectImagesForSlots();
     void GarbageCollectSamplers();
 
 private:
@@ -331,33 +444,38 @@ private:
     AmdGpu::Liverpool* liverpool;
     BufferCache& buffer_cache;
     PageManager& tracker;
+    PageTable page_table;
     Common::SlotVector<Image> slot_images;
     Common::SlotVector<ImageView> slot_image_views;
+    Common::SlotVector<Sampler> slot_samplers;
     BlitHelper blit_helper;
     TileManager tile_manager;
-    tsl::robin_map<u64, Sampler> samplers;
-    std::unordered_set<ImageId> download_images;
+    absl::flat_hash_map<u64, SamplerId> samplers;
+    absl::flat_hash_set<ImageId> download_images;
     u64 total_used_memory = 0;
     u64 trigger_gc_memory = 0;
     u64 pressure_gc_memory = 0;
     u64 critical_gc_memory = 0;
+    bool relaxed_gc = false;
+    u64 last_slot_report = 0;
     u64 total_used_samplers = 0;
     u64 trigger_gc_samplers = 0;
     u64 pressure_gc_samplers = 0;
     u64 critical_gc_samplers = 0;
+    u64 sampler_generation = 0;
     u64 gc_tick = 0;
-    Common::LeastRecentlyUsedCache<ImageId, u64> lru_cache;
-    Common::LeastRecentlyUsedCache<u64, u64> sampler_lru_cache;
+    Common::LRUCache<Image> image_lru_cache;
+    Common::LRUCache<Sampler> sampler_lru_cache;
     const bool readback_linear_images;
-    PageTable page_table;
-    std::mutex mutex;
-    std::mutex samplers_mutex;
     std::mutex download_images_mutex;
     struct MetaDataInfo {
         MetaType type;
         s32 clear_mask = -1;
     };
-    tsl::robin_map<VAddr, MetaDataInfo> surface_metas;
+    absl::flat_hash_map<VAddr, MetaDataInfo> surface_metas;
+    std::vector<BindingLookup> binding_lookups;
+    /// Changes whenever an image is added to or removed from the page table.
+    u64 image_generation{1};
 };
 
 } // namespace VideoCore

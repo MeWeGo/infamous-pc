@@ -2,15 +2,20 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <utility>
+#include <boost/container/small_vector.hpp>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/div_ceil.h"
 #include "common/error.h"
 #include "common/multi_level_page_table.h"
+#include "common/perf_profiler.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "common/tuning.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -36,6 +41,10 @@
 #endif
 
 namespace VideoCore {
+
+/// Deferred protection (PageManager::DeferProtect): page ranges [first, end) whose new
+/// protection the calling thread left to RefreshDeferredProtect. Null when not deferring.
+thread_local std::vector<std::pair<u64, u64>>* t_deferred_protect = nullptr;
 
 struct PageManager::Impl {
     struct PageState {
@@ -91,6 +100,10 @@ struct PageManager::Impl {
     static constexpr size_t ADDRESS_BITS = 40;
     static constexpr size_t NUM_ADDRESS_PAGES = 1ULL << (40 - PM_PAGE_BITS);
     static constexpr size_t NUM_ADDRESS_LOCKS = NUM_ADDRESS_PAGES / NUM_REGION_PAGES;
+    /// Pages are locked in groups of this many. Protecting memory again on the GPU thread took a
+    /// lock for each page of it, and taking and releasing them cost about as much as the rest of
+    /// going over the pages.
+    static constexpr size_t LOCK_GROUP_BITS = 6;
     inline static Vulkan::Rasterizer* rasterizer;
 
     Impl() = default;
@@ -112,7 +125,26 @@ struct PageManager::Impl {
         const size_t start_page = begin >> PM_PAGE_BITS;
         const size_t end_page = end >> PM_PAGE_BITS;
         cached_pages.reserve(start_page, end_page);
-        locks.reserve(start_page, end_page);
+        locks.reserve(start_page >> LOCK_GROUP_BITS, end_page >> LOCK_GROUP_BITS);
+    }
+
+    /// Groups of pages a thread changing watchers locked, in the order it locked them.
+    using LockedGroups = boost::container::small_vector<u64, 16>;
+
+    /// Locks the group of a page, unless it is the group locked last. Pages are visited in
+    /// order, so each group is locked once, and in the same order by every thread.
+    void LockGroup(u64 page, LockedGroups& locked) {
+        const u64 group = page >> LOCK_GROUP_BITS;
+        if (locked.empty() || locked.back() != group) {
+            locks[group].lock();
+            locked.push_back(group);
+        }
+    }
+
+    void UnlockGroups(const LockedGroups& locked) {
+        for (const u64 group : locked) {
+            locks[group].unlock();
+        }
     }
 
     void UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) {
@@ -142,13 +174,14 @@ struct PageManager::Impl {
             EnsurePages(aligned_addr, aligned_end);
         }
 
+        LockedGroups locked;
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(page);
             if (!state) {
                 continue;
             }
 
-            locks[page].lock();
+            LockGroup(page, locked);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -180,16 +213,12 @@ struct PageManager::Impl {
         // Add pending (un)protect action
         release_pending();
 
-        for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(page)) {
-                lock->unlock();
-            }
-        }
+        UnlockGroups(locked);
     }
 
     void UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bounds,
-                                     const RegionBits& write_mask, const RegionBits& read_mask,
-                                     PageOp write_op, PageOp read_op) {
+                                      const RegionBits& write_mask, const RegionBits& read_mask,
+                                      PageOp write_op, PageOp read_op) {
         const u64 base_page = base_addr >> PM_PAGE_BITS;
         const u64 page_start = bounds.start_word * PAGES_PER_WORD + bounds.start_page;
         const u64 page_end = bounds.end_word * PAGES_PER_WORD + bounds.end_page + 1;
@@ -201,19 +230,34 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
-                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                bool deferred = false;
+                if (t_deferred_protect) {
+                    // The upload worker applies the protection before it copies the pages,
+                    // so a guest write in between is caught by its snapshot, and one after
+                    // faults and re-dirties the page.
+                    t_deferred_protect->emplace_back(range_begin, range_begin + range_pages);
+                    deferred = true;
+                }
+                if (deferred_protection) {
+                    deferred_protection->emplace_back(range_begin, range_pages);
+                    deferred = true;
+                }
+                if (!deferred) {
+                    Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                }
                 range_pages = 0;
                 potential_pages = 0;
             }
         };
 
+        LockedGroups locked;
         for (u64 page = page_start; page != page_end; ++page) {
             PageState* state = cached_pages.find(base_page + page);
             if (!state) {
                 continue;
             }
 
-            locks[base_page + page].lock();
+            LockGroup(base_page + page, locked);
 
             const auto old_perms = state->Perms();
             if (page == page_start) {
@@ -249,12 +293,88 @@ struct PageManager::Impl {
         // Add pending (un)protect action
         release_pending();
 
-        for (u64 page = page_start; page != page_end; ++page) {
-            if (auto* lock = locks.find(base_page + page)) {
-                lock->unlock();
-            }
-        }
+        UnlockGroups(locked);
     }
+
+    u64 RefreshDeferredProtect(u64 first_page, u64 end_page) {
+        u64 covered_pages = 0;
+        Core::MemoryPermission perms{};
+        u64 range_begin = first_page;
+        u64 range_pages = 0;
+
+        const auto release_pending = [&] {
+            if (range_pages > 0) {
+                Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
+                covered_pages += range_pages;
+                range_pages = 0;
+            }
+        };
+
+        LockedGroups locked;
+        for (u64 page = first_page; page != end_page; ++page) {
+            const PageState* state = cached_pages.find(page);
+            if (!state) {
+                // No tracked page: end the run rather than protect a page nobody watches.
+                release_pending();
+                continue;
+            }
+            LockGroup(page, locked);
+            const auto page_perms = state->Perms();
+            if (range_pages == 0) {
+                range_begin = page;
+                perms = page_perms;
+            } else if (page_perms != perms) {
+                release_pending();
+                range_begin = page;
+                perms = page_perms;
+            }
+            ++range_pages;
+        }
+        release_pending();
+
+        UnlockGroups(locked);
+        return covered_pages;
+    }
+
+    void ApplyProtection(u64 first_page, u64 num_pages) {
+        Core::MemoryPermission perms{};
+        u64 run_begin = first_page;
+        u64 run_pages = 0;
+        const auto release_run = [&] {
+            if (run_pages > 0) {
+                Protect(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS, perms);
+                run_pages = 0;
+            }
+        };
+        // Under the locks of the pages, so the state read is what any change made since applied
+        // too, and any change made after it is applied after this.
+        LockedGroups locked;
+        for (u64 page = first_page; page != first_page + num_pages; ++page) {
+            const PageState* state = cached_pages.find(page);
+            if (!state) {
+                release_run();
+                continue;
+            }
+            LockGroup(page, locked);
+            const auto page_perms = state->Perms();
+            if (run_pages != 0 && page_perms != perms) {
+                release_run();
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+                perms = page_perms;
+            }
+            ++run_pages;
+        }
+        release_run();
+        UnlockGroups(locked);
+    }
+
+    /// Where the calling thread adds pages whose protection it changes for regions instead of
+    /// applying it, if anywhere.
+    inline static thread_local PendingProtection* deferred_protection = nullptr;
+    /// Whether the calling thread applies protection others deferred.
+    inline static thread_local bool applies_deferred_protection = false;
 
     struct PageTraits {
         using Entry = PageState;
@@ -272,9 +392,10 @@ struct PageManager::Impl {
 #endif
         static constexpr size_t ADDRESS_SPACE_BITS = ADDRESS_BITS;
         static constexpr size_t L1_BITS = 16;
-        static constexpr size_t PAGE_BITS = PM_PAGE_BITS;
+        static constexpr size_t PAGE_BITS = PM_PAGE_BITS + LOCK_GROUP_BITS;
         static constexpr bool NULL_CHECK = false;
     };
+    /// One for each group of pages, see LOCK_GROUP_BITS.
     Common::MultiLevelPageTable<MutexTraits> locks;
 };
 
@@ -424,6 +545,17 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        if (applies_deferred_protection) {
+            // Counted with the rest of that thread's work.
+            ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                       "Attempted to protect region as write-only which is not a valid permission");
+            Core::Memory::Instance()->GetAddressSpace().Protect(address, size, perms);
+            return;
+        }
+        Common::Perf::ScopedStall stall{std::this_thread::get_id() ==
+                                                rasterizer->GetGpuCommandProcessorThread()
+                                            ? Common::Perf::Stall::PageProtectGpu
+                                            : Common::Perf::Stall::PageProtect};
         auto* memory = Core::Memory::Instance();
         auto& impl = memory->GetAddressSpace();
         ASSERT_MSG(perms != Core::MemoryPermission::Write,
@@ -432,16 +564,80 @@ struct SignalImpl : public PageManager::Impl {
     }
 
     static bool GuestFaultSignalHandler(void* context, void* fault_address) {
+        Common::Perf::ScopedStall stall{Common::Perf::Stall::PageFault};
         const auto addr = reinterpret_cast<VAddr>(fault_address);
         const auto size = std::min<u64>(8, PageManager::GetNextPageAddr(addr) - addr);
         const auto is_gpu_thread =
             std::this_thread::get_id() == rasterizer->GetGpuCommandProcessorThread();
         if (Common::IsWriteError(context)) {
-            return rasterizer->InvalidateMemory(addr, size, is_gpu_thread);
+            if (!rasterizer->InvalidateMemory(addr, size, is_gpu_thread)) {
+                return false;
+            }
+            if (!is_gpu_thread) {
+                CountWriteFault(addr);
+                InvalidateAhead(addr);
+            }
+            return true;
         } else {
-            return rasterizer->ReadMemory(addr, size, is_gpu_thread);
+            if (!rasterizer->ReadMemory(addr, size, is_gpu_thread)) {
+                return false;
+            }
+            if (!is_gpu_thread) {
+                Common::Perf::Count(Common::Perf::Counter::ReadFaults);
+            }
+            return true;
         }
         return false;
+    }
+
+    /// Counts a write fault for the perf summary, telling apart faults on pages that faulted
+    /// shortly before, which the GPU took a copy of in between, and faults on the page after one
+    /// that did, as threads filling a buffer together make. Pages are kept in a small table of
+    /// the last frames' faults, which only has to be right most of the time.
+    static void CountWriteFault(VAddr addr) {
+        static constexpr size_t NumEntries = 8192;
+        static std::array<std::atomic<u64>, NumEntries> recent{};
+        const u64 frame = Common::Perf::FrameNumber() & 0xFFFF;
+        const auto faulted_lately = [frame](u64 page) {
+            const u64 entry = recent[page % NumEntries].load(std::memory_order_relaxed);
+            return (entry >> 16) == page && ((frame - (entry & 0xFFFF)) & 0xFFFF) <= 1;
+        };
+        const u64 page = addr >> PageManager::PM_PAGE_BITS;
+        Common::Perf::Count(Common::Perf::Counter::WriteFaults);
+        if (faulted_lately(page)) {
+            Common::Perf::Count(Common::Perf::Counter::WriteFaultsRepeated);
+        } else if (faulted_lately(page - 1)) {
+            Common::Perf::Count(Common::Perf::Counter::WriteFaultsFollowing);
+        }
+        recent[page % NumEntries].store(page << 16 | frame, std::memory_order_relaxed);
+    }
+
+    /// A thread filling a buffer faults on every page of it, a million times every ten seconds
+    /// in inFAMOUS Second Son, with its threads spending seconds in the handler. Once a thread
+    /// faults on a few pages in a row, the pages ahead of it are marked CPU modified along with
+    /// the one it faulted on, more of them the longer it keeps going, so it faults once a block.
+    /// Pages it stops short of are only uploaded again, which costs less than the faults saved.
+    static void InvalidateAhead(VAddr addr) {
+        static const u32 MinRun = static_cast<u32>(Common::Tune("SHAD_AHEAD_MINRUN", 2));
+        static const u64 MaxPagesAhead = Common::Tune("SHAD_AHEAD_MAX", 16);
+        static const u64 FirstPagesAhead = Common::Tune("SHAD_AHEAD_BASE", 4);
+        if (MaxPagesAhead == 0) {
+            return;
+        }
+        thread_local u64 last_page = 0;
+        thread_local u32 run = 0;
+        const u64 page = addr >> PageManager::PM_PAGE_BITS;
+        run = page == last_page + 1 ? run + 1 : 0;
+        last_page = page;
+        if (run < MinRun) {
+            return;
+        }
+        const u64 pages_ahead =
+            std::min<u64>(FirstPagesAhead << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
+        rasterizer->InvalidateBuffersAhead((page + 1) << PageManager::PM_PAGE_BITS,
+                                           pages_ahead << PageManager::PM_PAGE_BITS);
+        // The next fault of the thread going on is on the page after them.
+        last_page = page + pages_ahead;
     }
 };
 
@@ -471,6 +667,18 @@ void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
 }
 
+void PageManager::DeferProtection(PendingProtection* pending) {
+    Impl::deferred_protection = pending;
+}
+
+void PageManager::ApplyProtection(u64 first_page, u64 num_pages) const {
+    impl->ApplyProtection(first_page, num_pages);
+}
+
+void PageManager::AppliesDeferredProtection() {
+    Impl::applies_deferred_protection = true;
+}
+
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {
     impl->UpdatePageWatchers(addr, size, write_op);
 }
@@ -480,6 +688,14 @@ void PageManager::UpdatePageWatchersForRegion(VAddr base_addr, const Bounds& bou
                                               const RegionBits& read_mask, PageOp write_op,
                                               PageOp read_op) const {
     impl->UpdatePageWatchersForRegion(base_addr, bounds, write_mask, read_mask, write_op, read_op);
+}
+
+void PageManager::DeferProtect(std::vector<std::pair<u64, u64>>* deferred_pages) {
+    t_deferred_protect = deferred_pages;
+}
+
+u64 PageManager::RefreshDeferredProtect(u64 first_page, u64 end_page) const {
+    return impl->RefreshDeferredProtect(first_page, end_page);
 }
 
 } // namespace VideoCore

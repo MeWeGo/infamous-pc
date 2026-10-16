@@ -32,7 +32,7 @@ struct TilingInfo {
     u32 bank_swizzle;
     u32 micro_tiled_mips;
     u32 num_mips;
-    std::array<ImageInfo::MipInfo, 16> mips;
+    std::array<MipInfo, MAX_MIPS> mips;
 };
 
 TileManager::TileManager(const Vulkan::Instance& instance_, Vulkan::Scheduler& scheduler_,
@@ -207,8 +207,8 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
         if (info.props.is_block) {
-            mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
-            mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+            mip_info.pitch = std::max<u16>((mip_info.pitch + 3) / 4, 1U);
+            mip_info.height = std::max<u16>((mip_info.height + 3) / 4, 1U);
         }
     }
 
@@ -225,7 +225,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, false));
+    scheduler.GetDynamicState().BindComputePipeline(cmdbuf, GetTilingPipeline(info, false));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = in_buffer->Handle(),
@@ -273,6 +273,7 @@ std::pair<const Buffer*, u64> TileManager::DetileImage(const VideoCore::Buffer* 
     runtime.AccessBuffer(staging.buffer, staging.offset, info.guest_size,
                          vk::PipelineStageFlagBits2::eComputeShader,
                          vk::AccessFlagBits2::eShaderWrite);
+    runtime.NoteBufferRead(in_buffer, in_offset, info.guest_size);
 
     return {staging.buffer, staging.offset};
 }
@@ -296,8 +297,8 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
         auto& mip_info = params.mips[mip];
         mip_info = info.mips_layout[mip];
         if (info.props.is_block) {
-            mip_info.pitch = std::max((mip_info.pitch + 3) / 4, 1U);
-            mip_info.height = std::max((mip_info.height + 3) / 4, 1U);
+            mip_info.pitch = std::max<u16>((mip_info.pitch + 3) / 4, 1U);
+            mip_info.height = std::max<u16>((mip_info.height + 3) / 4, 1U);
         }
     }
 
@@ -317,7 +318,7 @@ void TileManager::TileImage(Image& in_image, std::span<vk::BufferImageCopy> buff
     runtime.FlushBarriers();
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, GetTilingPipeline(info, true));
+    scheduler.GetDynamicState().BindComputePipeline(cmdbuf, GetTilingPipeline(info, true));
 
     const vk::DescriptorBufferInfo tiled_buffer_info{
         .buffer = out_buffer->Handle(),

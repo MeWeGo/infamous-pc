@@ -3,9 +3,11 @@
 
 #pragma once
 
+#include <atomic>
 #include <utility>
 
 #include "common/adaptive_mutex.h"
+#include "common/perf_profiler.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "video_core/buffer_cache/region_definitions.h"
@@ -19,6 +21,19 @@ using LockType = Common::AdaptiveMutex;
 using LockType = std::mutex;
 #endif
 
+/// Changes each time pages are newly marked modified from the CPU, or memory that may hold such
+/// pages comes into use, so uploading all of it again can be skipped when nothing changed since.
+inline std::atomic<u64> cpu_modified_generation{};
+
+/// Pages newly marked modified from the CPU are kept as rewritten for this many frames, and up to
+/// twice as many.
+constexpr u64 REWRITE_PERIOD_FRAMES = 16;
+
+/// The period pages newly marked modified from the CPU now are kept for.
+inline u32 CurrentRewritePeriod() {
+    return static_cast<u32>(Common::Perf::FrameNumber() / REWRITE_PERIOD_FRAMES);
+}
+
 /**
  * Allows tracking CPU and GPU modification of pages in a contigious virtual address region.
  * Information is stored in bitsets for spacial locality and fast update of single pages.
@@ -30,6 +45,8 @@ public:
           readbacks_mode{EmulatorSettings.GetReadbacksMode()} {
         cpu.Fill(~0ULL);
         gpu.Fill(0ULL);
+        cpu_words.store(~0ULL, std::memory_order_relaxed);
+        gpu_words.store(0, std::memory_order_relaxed);
     }
     explicit RegionManager() = default;
 
@@ -86,6 +103,9 @@ public:
         RegionBits read_prot;
         auto bounds = GetBounds(offset, size);
         Bounds watcher_bounds;
+        if (NothingToClear<cpu_op, gpu_op>(bounds)) {
+            return;
+        }
         if constexpr (locked) {
             mutex.lock();
         }
@@ -94,9 +114,7 @@ public:
         });
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
-        const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
-        if (update_watchers &&
-            GetWatcherBounds<cpu_op, gpu_op>(bounds, write_prot, read_prot, watcher_bounds)) {
+        if (GetWatcherBounds(bounds, write_op, read_op, write_prot, read_prot, watcher_bounds)) {
             tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
                                                  write_op, read_op);
         }
@@ -114,6 +132,16 @@ public:
         u64 end_page{};
         auto bounds = GetBounds(offset, size);
         Bounds watcher_bounds;
+        // Buffers bound for every draw are usually clean, and walking their bits for nothing
+        // took a good part of the GPU thread's time. This is checked before taking the lock:
+        // game threads hold it while their page faults change page protection, and the GPU
+        // thread spent a tenth of its time taking it or waiting on them. Pages a game thread
+        // marks right after this check are found by the next look, as they would be if it had
+        // taken the lock first.
+        if ((GetRegionWords<type>() & WordsMask(bounds)) == 0 &&
+            NothingToClear<cpu_op, gpu_op>(bounds)) {
+            return;
+        }
         if constexpr (locked) {
             mutex.lock();
         }
@@ -139,9 +167,7 @@ public:
         }
         const auto write_op = GetPageOp<Type::CPU>(cpu_op);
         const auto read_op = GetPageOp<Type::GPU>(gpu_op);
-        const bool update_watchers = write_op != PageOp::None || read_op != PageOp::None;
-        if (update_watchers &&
-            GetWatcherBounds<cpu_op, gpu_op>(bounds, write_prot, read_prot, watcher_bounds)) {
+        if (GetWatcherBounds(bounds, write_op, read_op, write_prot, read_prot, watcher_bounds)) {
             tracker->UpdatePageWatchersForRegion(cpu_addr, watcher_bounds, write_prot, read_prot,
                                                  write_op, read_op);
         }
@@ -153,6 +179,9 @@ public:
     template <Type type>
     bool IsRegionModified(u64 offset, u64 size) noexcept {
         auto& state = GetRegionBits<type>();
+        if ((GetRegionWords<type>() & WordsMask(GetBounds(offset, size))) == 0) {
+            return false;
+        }
         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
         const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
         if (start_word == end_word) [[likely]] {
@@ -170,6 +199,38 @@ public:
         }
     }
 
+    /// Returns true if all of a region is modified from the CPU.
+    bool IsRegionFullyCpuModified(u64 offset, u64 size) const noexcept {
+        bool full = true;
+        IterateWords(GetBounds(offset, size),
+                     [&](u64 index, u64 mask) { full &= (cpu[index] & mask) == mask; });
+        return full;
+    }
+
+    /// Returns true if all of a region is modified from the GPU.
+    bool IsRegionFullyGpuModified(u64 offset, u64 size) const noexcept {
+        bool full = true;
+        IterateWords(GetBounds(offset, size),
+                     [&](u64 index, u64 mask) { full &= (gpu[index] & mask) == mask; });
+        return full;
+    }
+
+    /// Returns true if pages of a region were newly marked modified from the CPU in the period or
+    /// the one before. Read without the lock, so it may miss marks made meanwhile.
+    bool IsRegionRewritten(u64 offset, u64 size, u32 period) const noexcept {
+        const u32 marked = rewrite_period.load(std::memory_order_relaxed);
+        if (marked != period && marked + 1 != period) {
+            return false;
+        }
+        bool rewritten = false;
+        IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
+            const u64 bits =
+                rewritten_now[index] | (marked == period ? rewritten_before[index] : 0);
+            rewritten |= (bits & mask) != 0;
+        });
+        return rewritten;
+    }
+
     void Lock(const Bounds& bounds) noexcept {
         mutex.lock();
     }
@@ -179,6 +240,52 @@ public:
     }
 
 private:
+    /// Bits for the words in the bounds, in the layout of cpu_words and gpu_words.
+    static constexpr u64 WordsMask(const Bounds& bounds) {
+        static_assert(NUM_REGION_WORDS == 64);
+        return (~0ULL << bounds.start_word) & (~0ULL >> (63 - bounds.end_word));
+    }
+
+    /// Notes pages newly marked modified from the CPU. With the lock held.
+    void MarkRewritten(u64 index, u64 pages) {
+        const u32 period = CurrentRewritePeriod();
+        const u32 marked = rewrite_period.load(std::memory_order_relaxed);
+        if (marked != period) {
+            if (marked + 1 == period) {
+                rewritten_before = rewritten_now;
+            } else {
+                rewritten_before.Fill(0);
+            }
+            rewritten_now.Fill(0);
+            rewrite_period.store(period, std::memory_order_relaxed);
+        }
+        rewritten_now[index] |= pages;
+    }
+
+    /// Only changed with the lock held, but read without it.
+    static void SetWordBit(std::atomic<u64>& words, u64 index, bool dirty) {
+        const u64 old_words = words.load(std::memory_order_relaxed);
+        words.store(dirty ? old_words | (1ULL << index) : old_words & ~(1ULL << index),
+                    std::memory_order_relaxed);
+    }
+
+    /// Returns true if the operations can only clear bits, and none are set in the bounds, so
+    /// applying them changes nothing.
+    template <StateOp cpu_op, StateOp gpu_op>
+    bool NothingToClear(const Bounds& bounds) const {
+        if constexpr (cpu_op == StateOp::Set || gpu_op == StateOp::Set) {
+            return false;
+        }
+        u64 words{};
+        if constexpr (cpu_op == StateOp::Clear) {
+            words |= cpu_words.load(std::memory_order_relaxed);
+        }
+        if constexpr (gpu_op == StateOp::Clear) {
+            words |= gpu_words.load(std::memory_order_relaxed);
+        }
+        return (words & WordsMask(bounds)) == 0;
+    }
+
     template <StateOp cpu_op, StateOp gpu_op>
     void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
                                   u64 mask) {
@@ -189,7 +296,14 @@ private:
             } else {
                 cpu[index] |= mask;
             }
+            SetWordBit(cpu_words, index, cpu[index] != 0);
             write_prot[index] = (cpu[index] ^ prev) & mask;
+            if constexpr (cpu_op == StateOp::Set) {
+                if (write_prot[index] != 0) {
+                    cpu_modified_generation.fetch_add(1, std::memory_order_release);
+                    MarkRewritten(index, write_prot[index]);
+                }
+            }
         }
         if constexpr (gpu_op != StateOp::None) {
             const u64 prev = gpu[index];
@@ -198,19 +312,28 @@ private:
             } else {
                 gpu[index] |= mask;
             }
+            SetWordBit(gpu_words, index, gpu[index] != 0);
             read_prot[index] = (gpu[index] ^ prev) & mask;
         }
     }
 
-    template <StateOp cpu_op, StateOp gpu_op>
-    static bool GetWatcherBounds(const Bounds& bounds, RegionBits& write_prot,
-                                 RegionBits& read_prot, Bounds& watcher_bounds) {
+    /// Finds the pages in the bounds whose watchers change. Only changes that come with a page
+    /// operation count: with GPU readbacks off, newly GPU modified pages need none, and walking
+    /// every page of a written buffer for them took locks on each for nothing.
+    static bool GetWatcherBounds(const Bounds& bounds, PageOp write_op, PageOp read_op,
+                                 RegionBits& write_prot, RegionBits& read_prot,
+                                 Bounds& watcher_bounds) {
+        const bool use_write = write_op != PageOp::None;
+        const bool use_read = read_op != PageOp::None;
+        if (!use_write && !use_read) {
+            return false;
+        }
         const auto prot = [&](u64 index) {
             u64 word{};
-            if constexpr (cpu_op != StateOp::None) {
+            if (use_write) {
                 word |= write_prot[index];
             }
-            if constexpr (gpu_op != StateOp::None) {
+            if (use_read) {
                 word |= read_prot[index];
             }
             return word;
@@ -258,6 +381,16 @@ private:
 
     template <Type type>
         requires(std::popcount(std::to_underlying(type)) == 1)
+    u64 GetRegionWords() const noexcept {
+        if constexpr (type == Type::CPU) {
+            return cpu_words.load(std::memory_order_relaxed);
+        } else {
+            return gpu_words.load(std::memory_order_relaxed);
+        }
+    }
+
+    template <Type type>
+        requires(std::popcount(std::to_underlying(type)) == 1)
     RegionBits& GetRegionBits() noexcept {
         if constexpr (type == Type::CPU) {
             return cpu;
@@ -271,6 +404,13 @@ private:
     u32 readbacks_mode;
     RegionBits cpu;
     RegionBits gpu;
+    /// Pages newly marked modified from the CPU in the rewrite period and the one before.
+    RegionBits rewritten_now{};
+    RegionBits rewritten_before{};
+    std::atomic<u32> rewrite_period{};
+    /// One bit per word of cpu and gpu, set while the word has any page marked.
+    std::atomic<u64> cpu_words{};
+    std::atomic<u64> gpu_words{};
     LockType mutex;
 };
 

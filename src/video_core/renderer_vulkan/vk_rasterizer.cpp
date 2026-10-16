@@ -2,6 +2,10 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/debug.h"
+#include <atomic>
+#include <cstdlib>
+
+#include "common/perf_profiler.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
@@ -32,9 +36,22 @@ static Shader::PushData MakeUserData(const AmdGpu::Regs& regs) {
     return push_data;
 }
 
+/// Builds the key a binding's image is looked up by from everything its descriptor is built from.
+template <size_t... Sizes>
+static auto MakeKey(VideoCore::TextureCache::BindingType type, u32 extra,
+                    const std::array<u32, Sizes>&... parts) {
+    std::array<u32, 2 + (Sizes + ...)> key{};
+    key[0] = static_cast<u32>(type);
+    key[1] = extra;
+    size_t offset = 2;
+    ((std::ranges::copy(parts, key.begin() + offset), offset += Sizes), ...);
+    return key;
+}
+
 Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime& runtime_,
                        AmdGpu::Liverpool* liverpool_)
-    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, page_manager{this},
+    : instance{instance_}, scheduler{scheduler_}, runtime{runtime_}, compute_queue{instance_},
+      page_manager{this},
       buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache, page_manager},
       texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
@@ -47,12 +64,97 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     memory->SetRasterizer(this);
 
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
+        // The staging the upload worker copies into must be complete before the command
+        // buffers using it reach the driver, and with them every page the uploads
+        // protect.
+        buffer_cache.FlushUploadJobs();
+        // Submit the compute batch before the graphics submit: the graphics work
+        // consuming its results waits for its tick below, and the batch overlaps
+        // with the graphics work after this submission.
+        SubmitComputeBatch();
+        // Graphics work consuming async-compute results waits for them here, so
+        // dispatches routed to the compute queue overlap instead of serializing.
+        if (const u64 wait = buffer_cache.ConsumePendingComputeWait()) {
+            info.AddWait(compute_queue.GetSemaphore().Handle(), wait);
+        }
         runtime.FlushBarriers();
         buffer_cache.SubmitPendingArenaBinds(info);
     });
+    buffer_cache.GetStreamBuffer().SetComputeWaiter([this](u64 tick, bool allow_wait) {
+        if (compute_queue.IsFree(tick)) {
+            return true;
+        }
+        if (!allow_wait) {
+            return false;
+        }
+        // The tick this watch was tagged with is the one the open batch will
+        // signal: submit it, or waiting for the tick deadlocks (nothing signals
+        // it until the batch reaches the compute queue).
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+        }
+        compute_queue.Wait(tick);
+        return true;
+    });
+    buffer_cache.SetComputeIsFree(
+        [this](u64 tick) { return compute_queue.IsFree(tick); });
+    // The second queue doubles as the readback queue: copies of GPU modified
+    // memory wait for the submission that wrote it, not the whole timeline.
+    buffer_cache.SetReadbackQueue(&compute_queue);
+    // A readback of memory the compute batch writes needs the batch submitted
+    // first: its results aren't in the queue until then.
+    buffer_cache.SetComputeBatchFlusher([this]() { SubmitComputeBatch(); });
+    buffer_cache.SetComputeFence([this]() -> std::pair<vk::Semaphore, u64> {
+        if (!compute_queue.IsAvailable()) {
+            return {vk::Semaphore{}, 0};
+        }
+        // The open batch's dispatches reference memory a sparse bind may remap:
+        // submit it, so the bind waits for a tick that is actually signalled.
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+        }
+        const u64 tick = compute_queue.CurrentTick();
+        return {compute_queue.GetSemaphore().Handle(), tick > 0 ? tick - 1 : 0};
+    });
+
+    if (const auto async_queue = instance.GetAsyncQueue()) {
+        async_scheduler =
+            std::make_unique<Scheduler>(instance, scheduler.RecordsOnThread(), async_queue);
+        runtime.SetAsyncScheduler(async_scheduler.get());
+        buffer_cache.SetHostWorkOn(*async_scheduler);
+        // What the graphics queue runs next was recorded after all work submitted to the second
+        // queue so far, and may read what that wrote. Waiting for it also keeps what that work
+        // uses alive as long as the graphics tick it was recorded in.
+        scheduler.SetPreSubmitCallback([this](Vulkan::SubmitInfo& info) {
+            runtime.OnGraphicsSubmit(scheduler.CurrentTick());
+            const u64 tick = runtime.FlushAsync();
+            if (tick > async_tick_waited) {
+                info.AddWait(async_scheduler->GetWorkSemaphore()->Handle(), tick);
+                info.submitted_first = async_scheduler.get();
+                info.submitted_first_tick = tick;
+                async_tick_waited = tick;
+            }
+        });
+        // Work on the second queue waits for the graphics work submitted it depends on.
+        async_scheduler->SetPreSubmitCallback([this](Vulkan::SubmitInfo& info) {
+            const u64 tick = runtime.AsyncGraphicsWait();
+            if (tick > graphics_tick_waited) {
+                info.AddWait(scheduler.GetWorkSemaphore()->Handle(), tick);
+                info.submitted_first = &scheduler;
+                info.submitted_first_tick = tick;
+                graphics_tick_waited = tick;
+            }
+        });
+    }
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    if (async_scheduler) {
+        runtime.FlushAsync();
+        async_scheduler->Finish();
+        runtime.SetAsyncScheduler(nullptr);
+    }
+}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
@@ -105,6 +207,34 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
     // Prefetch render targets to handle overlaps with bound textures (e.g. mipgen)
     const auto& key = pipeline->GetGraphicsKey();
     const auto& regs = liverpool->regs;
+
+    // Draws mostly render to the targets the draw before them did. With the registers they are
+    // found from and the images in the cache unchanged, the same images are found again, and
+    // building the key and descriptor of each target to look them up was a part of every draw.
+    RenderTargetInputs inputs{
+        .regs_version = liverpool->context_regs_version,
+        .image_generation = texture_cache.ImageGeneration(),
+        .db_extent = liverpool->last_db_extent.raw,
+        .mrt_mask = key.mrt_mask,
+    };
+    for (u32 cb = 0; cb < AmdGpu::NUM_COLOR_BUFFERS; ++cb) {
+        inputs.cb_extents[cb] = liverpool->last_cb_extent[cb].raw;
+    }
+    if (inputs == last_render_target_inputs) {
+        const auto bind_target = [&](VideoCore::ImageId image_id) {
+            if (image_id) {
+                bound_images.emplace_back(image_id);
+                texture_cache.GetImage(image_id).binding.is_target = 1u;
+            }
+        };
+        for (s32 cb = 0; cb < std::bit_width(key.mrt_mask); ++cb) {
+            bind_target(cb_descs[cb].image_id);
+        }
+        bind_target(db_desc.first);
+        return;
+    }
+    last_render_target_inputs = inputs;
+
     if (regs.color_control.degamma_enable) {
         LOG_WARNING(Render_Vulkan, "Color buffers require gamma correction");
     }
@@ -120,8 +250,10 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
             continue;
         }
         const auto& hint = liverpool->last_cb_extent[cb];
-        std::construct_at(&desc, col_buf, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        const auto key = MakeKey(VideoCore::TextureCache::BindingType::RenderTarget, hint.raw,
+                                 std::bit_cast<std::array<u32, sizeof(col_buf) / 4>>(col_buf));
+        image_id = bound_images.emplace_back(texture_cache.FindImageCached(
+            key, desc, [&](auto& new_desc) { std::construct_at(&new_desc, col_buf, hint); }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     }
@@ -131,9 +263,17 @@ void Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         const auto htile_address = regs.depth_htile_data_base.GetAddress();
         const auto& hint = liverpool->last_db_extent;
         auto& [image_id, desc] = db_desc;
-        std::construct_at(&desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
-                          htile_address, hint);
-        image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
+        const auto key = MakeKey(
+            VideoCore::TextureCache::BindingType::DepthTarget, hint.raw,
+            std::bit_cast<std::array<u32, sizeof(regs.depth_buffer) / 4>>(regs.depth_buffer),
+            std::array<u32, 4>{
+                std::bit_cast<u32>(regs.depth_view), u32{regs.depth_control.depth_write_enable},
+                static_cast<u32>(htile_address), static_cast<u32>(htile_address >> 32)});
+        image_id =
+            bound_images.emplace_back(texture_cache.FindImageCached(key, desc, [&](auto& new_desc) {
+                std::construct_at(&new_desc, regs.depth_buffer, regs.depth_view, regs.depth_control,
+                                  htile_address, hint);
+            }));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
     } else {
@@ -199,14 +339,37 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // Before anything of the draw itself is recorded, which has to go with it.
+    scheduler.SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
+
+    if (scheduler.TimingDispatches()) {
+        // The draw is named by its pixel shader, or by its vertex shader if it has none.
+        const auto* vertex_info = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        const auto* pixel_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u64 vertex_hash = vertex_info ? vertex_info->pgm_hash : 0;
+        scheduler.MarkDispatch(
+            Scheduler::DispatchMark::Begin, pixel_info ? pixel_info->pgm_hash : vertex_hash,
+            regs.num_indices * regs.num_instances.NumInstances(), false, false, true, vertex_hash);
+    }
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
     }
 
+    scheduler.MarkWorkRun(false);
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        if (last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        // Draws read and write in graphics stages only. A compute dispatch reading the
+        // same memory later issues its own barrier with a compute destination, so the
+        // narrow destination costs nothing in correctness: the src stages the barrier
+        // accumulates (from ResetBindings of the work before) cover whatever wrote.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eAllGraphics,
+                              vk::AccessFlagBits2::eMemoryRead |
+                                  vk::AccessFlagBits2::eMemoryWrite);
     }
 
     pipeline->BindResources(set_writes, push_data);
@@ -218,8 +381,9 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Start);
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -227,7 +391,12 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    scheduler.MarkDispatch(Scheduler::DispatchMark::End);
     DebugState.IncDrawCall();
+    Common::Perf::Count(Common::Perf::Counter::Draws);
+    if (std::exchange(last_work_compute, false)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
+    }
 
     ResetBindings(false);
 }
@@ -246,6 +415,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
         .instance_sgpr_offset = instance_sgpr_offset,
+        .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
     if (!pipeline) {
@@ -257,6 +427,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         return;
     }
     const auto state = BeginRendering(pipeline);
+    // Before anything of the draw itself is recorded, which has to go with it.
+    scheduler.SubmitIfWorkPiledUp(state);
+    scheduler.CountWork();
 
     BindVertexBuffers(pipeline);
     if (is_indexed) {
@@ -266,16 +439,27 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto [buffer, base] =
         buffer_cache.ObtainBuffer(arg_address + offset, stride * max_count, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, stride * max_count);
+    runtime.NoteBufferRead(buffer, base, stride * max_count);
 
     const VideoCore::Buffer* count_buffer;
     u64 count_offset;
     if (count_address != 0) {
         std::tie(count_buffer, count_offset) = buffer_cache.ObtainBuffer(count_address, 4, false);
         needs_barrier |= runtime.IsBufferAccessed(count_buffer, count_offset, 4);
+        runtime.NoteBufferRead(count_buffer, count_offset, 4);
     }
 
+    scheduler.MarkWorkRun(false);
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        if (last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        // Draws, including indirect ones, read and write in graphics stages only
+        // (the draw indirect stage is part of all graphics). A compute dispatch
+        // reading the same memory later issues its own barrier.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eAllGraphics,
+                              vk::AccessFlagBits2::eMemoryRead |
+                                  vk::AccessFlagBits2::eMemoryWrite);
     }
 
     pipeline->BindResources(set_writes, push_data);
@@ -283,7 +467,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     scheduler.BeginRendering(state);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
+    scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
@@ -295,6 +479,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndexedIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+        Common::Perf::Count(Common::Perf::Counter::Draws);
     } else {
         ASSERT(sizeof(VkDrawIndirectCommand) == stride);
 
@@ -305,15 +490,279 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
             cmdbuf.drawIndirect(buffer->Handle(), base, max_count, stride);
         }
         DebugState.IncDrawCall();
+        Common::Perf::Count(Common::Perf::Counter::Draws);
+    }
+    if (std::exchange(last_work_compute, false)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
     }
 
     ResetBindings(false);
+}
+
+void Rasterizer::BindComputePipeline(const ComputePipeline& pipeline) {
+    auto& dynamic_state = scheduler.GetDynamicState();
+    if (pipeline.IsReady()) {
+        dynamic_state.BindComputePipeline(scheduler.CommandBuffer(), pipeline.Handle());
+    } else {
+        // Still being built: the GPU thread goes on, and the commands wait for it where they are
+        // recorded into Vulkan, on a thread of their own when they are.
+        dynamic_state.BindComputePipelineOnceBuilt(scheduler.CommandBuffer(), pipeline);
+    }
+}
+
+namespace {
+
+// Async compute routing, v2: batched. Read once, no settings churn:
+// 0 = everything on the graphics queue (default: the batch cannot see uploads
+//     recorded after it opened, and a compute shader reading stale arena data
+//     can hang the GPU — the game syncs its compute and graphics rings
+//     explicitly on PS4, which the emulator doesn't model yet), 1 = batched
+//     compute rings, 9 = per-dispatch (the failed v1, for triage only).
+int AsyncComputeMode() {
+    static const int mode = [] {
+        if (const char* v = std::getenv("SHADPS4_ASYNC_COMPUTE")) {
+            return std::atoi(v);
+        }
+        return 0;
+    }();
+    return mode;
+}
+
+} // namespace
+
+bool Rasterizer::IsAsyncComputeEligible(const ComputePipeline& pipeline, const Shader::Info& cs) {
+    if (AsyncComputeMode() <= 0) {
+        return false;
+    }
+    if (!compute_queue.IsAvailable() || !pipeline.IsReady()) {
+        return false;
+    }
+    // v2 routes the game's compute rings: on PS4 they run beside the graphics
+    // ring and their results are consumed by the next frame's draws or by the
+    // game reading them back. Graphics-ring dispatches feed the same frame's
+    // draws: those stay on the graphics queue.
+    if (AsyncComputeMode() == 1) {
+        if (!liverpool->IsComputeRingActive()) {
+            return false;
+        }
+    } else {
+        // v1 mode (9) routed graphics-ring dispatches; compute rings stayed
+        // on the graphics queue. Keep that split for triage.
+        if (liverpool->IsComputeRingActive()) {
+            return false;
+        }
+    }
+    // Buffers only: the images (layouts, barriers) are tracked for the graphics
+    // queue; the descriptors must be pushed (sets are recycled with it).
+    if (!cs.images.empty() || !cs.samplers.empty() || cs.uses_dma ||
+        !pipeline.UsesPushDescriptors()) {
+        return false;
+    }
+    for (const auto& desc : cs.buffers) {
+        if (!desc.IsSpecial()) {
+            continue;
+        }
+        switch (desc.buffer_type) {
+        case Shader::BufferType::Flatbuf:
+        case Shader::BufferType::ClipPlanes:
+        case Shader::BufferType::SharedMemory:
+            break; // Stream-backed, covered by dual-timeline retirement.
+        default:
+            return false;
+        }
+    }
+    // Buffers the dispatch writes that alias cached images are later sampled as
+    // textures on the graphics timeline, which has no compute-wait machinery:
+    // keep those dispatches serialized.
+    for (const auto& desc : cs.buffers) {
+        if (desc.IsSpecial() || !desc.is_written) {
+            continue;
+        }
+        const auto vsharp = desc.GetSharp(cs);
+        if (vsharp.base_address == 0 || vsharp.GetSize() == 0) {
+            continue;
+        }
+        if (texture_cache.FindImageFromRange(vsharp.base_address, vsharp.GetSize(), false)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void Rasterizer::RouteComputeDispatch(const ComputePipeline* pipeline) {
+    auto& stream = buffer_cache.GetStreamBuffer();
+
+    // v1 per-dispatch mode (9): submit each dispatch separately. Kept for triage.
+    if (AsyncComputeMode() == 9) {
+        stream.SetPendingComputeTick(compute_queue.ReserveTick());
+        if (!BindResources(pipeline)) {
+            stream.SetPendingComputeTick(0);
+            FlushGraphicsForCompute();
+            compute_queue.Begin();
+            compute_queue.Submit(ComputeSubmitWaits());
+            ResetComputeBindings();
+            return;
+        }
+        FlushGraphicsForCompute();
+        vk::CommandBuffer cb = compute_queue.Begin();
+        cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+        cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                         sizeof(push_data), &push_data);
+        if (!set_writes.empty()) {
+            cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, pipeline->GetLayout(), 0u,
+                                    set_writes);
+        }
+        const auto& cs_program = liverpool->GetCsRegs();
+        cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        const u64 ctick = compute_queue.Submit(ComputeSubmitWaits());
+        const VideoCore::Buffer* stream_buf = &stream;
+        for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+            (void)is_written;
+            if (!buffer || size == 0 || buffer == stream_buf) {
+                continue;
+            }
+            const VAddr base = buffer->cpu_addr + offset;
+            buffer_cache.NoteComputeWrites(base, base + size, ctick);
+        }
+        ResetComputeBindings();
+        scheduler.GetDynamicState().InvalidateComputePushConstants();
+        stream.SetPendingComputeTick(0);
+        DebugState.IncDispatch();
+        Common::Perf::Count(Common::Perf::Counter::Dispatches);
+        return;
+    }
+
+    // v2: batched. The game's compute-ring dispatches are collected in one
+    // command buffer through the frame and submitted at its end (or when a
+    // game thread reads back memory they wrote). Overlapping the next frame's
+    // draws is the point: the 14 ms of dispatches and 7.6 ms of draws of the
+    // fire scene add up serially today.
+    //
+    // The batch breaks every MaxBatchDispatches so each one waits for graphics
+    // work close to its own dispatches: a shader reading memory uploaded a
+    // hundred dispatches ago would otherwise see data from before the upload.
+    static constexpr size_t MaxBatchDispatches = 64;
+    static size_t batch_dispatch_count = 0;
+
+    stream.SetPendingComputeTick(compute_queue.ReserveTick());
+    if (!BindResources(pipeline)) {
+        stream.SetPendingComputeTick(0);
+        ResetComputeBindings();
+        return;
+    }
+    if (!compute_batch_cb || batch_dispatch_count >= MaxBatchDispatches) {
+        // Close the previous batch (its dispatches go to the compute queue with
+        // the graphics tick they began at) and open a new one.
+        if (compute_batch_cb) {
+            SubmitComputeBatch();
+            // A new batch: the stream commits in it get the next tick.
+            stream.SetPendingComputeTick(compute_queue.ReserveTick());
+        }
+        FlushGraphicsForCompute();
+        compute_batch_cb = compute_queue.Begin();
+        compute_batch_graphics_tick = scheduler.CurrentTick() > 0
+                                          ? scheduler.CurrentTick() - 1
+                                          : 0;
+        compute_batch_writes.clear();
+        batch_dispatch_count = 0;
+    }
+    compute_batch_cb.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    compute_batch_cb.pushConstants(pipeline->GetLayout(), vk::ShaderStageFlagBits::eCompute, 0u,
+                                   sizeof(push_data), &push_data);
+    if (!set_writes.empty()) {
+        compute_batch_cb.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute,
+                                               pipeline->GetLayout(), 0u, set_writes);
+    }
+    const auto& cs_program = liverpool->GetCsRegs();
+    compute_batch_cb.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+
+    // Collect write ranges: noted for graphics consumers and the readback queue
+    // once the batch is submitted and its tick is known.
+    const VideoCore::Buffer* stream_buf = &stream;
+    for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        (void)is_written;
+        if (!buffer || size == 0 || buffer == stream_buf) {
+            continue;
+        }
+        const VAddr base = buffer->cpu_addr + offset;
+        compute_batch_writes.push_back({base, base + size});
+    }
+    ResetComputeBindings();
+    // Push constants above bypassed the dynamic state tracking: the next
+    // primary-buffer compute push must re-emit.
+    scheduler.GetDynamicState().InvalidateComputePushConstants();
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    ++batch_dispatch_count;
+}
+
+void Rasterizer::SubmitComputeBatch() {
+    if (!compute_batch_cb) {
+        return;
+    }
+    // The batch waits for the graphics tick it began at and the memory fence
+    // (sparse binds up to then). Its own earlier batches chain automatically.
+    std::vector<std::pair<vk::Semaphore, u64>> waits;
+    if (compute_batch_graphics_tick > 0) {
+        waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(),
+                           compute_batch_graphics_tick);
+    }
+    if (const auto [sema, tick] = buffer_cache.MemoryFence(); sema && tick != 0) {
+        waits.emplace_back(sema, tick);
+    }
+    const u64 ctick = compute_queue.Submit(waits);
+    compute_batch_cb = vk::CommandBuffer{};
+    buffer_cache.GetStreamBuffer().SetPendingComputeTick(0);
+
+    // Tell graphics consumers overlapping these ranges to wait for this tick.
+    for (const auto& [start, end] : compute_batch_writes) {
+        buffer_cache.NoteComputeWrites(start, end, ctick);
+    }
+    compute_batch_writes.clear();
+
+    // Tell the readback queue the last write went to the compute timeline.
+    buffer_cache.NoteComputeWriteTick(ctick);
+
+    static std::atomic<u64> batch_count{0};
+    const u64 n = batch_count.fetch_add(1, std::memory_order_relaxed);
+    if (n < 5 || n % 100 == 0) {
+        LOG_INFO(Render_Vulkan, "Compute batch #{} submitted tick {}", n, ctick);
+    }
+}
+
+void Rasterizer::ResetComputeBindings() {
+    // Like ResetBindings but without runtime barrier tracking: visibility across
+    // timelines comes from semaphore waits, and epochs must stay untouched so
+    // later graphics checks see the same state.
+    bound_images.clear();
+    bound_buffers.clear();
+    needs_barrier = false;
+}
+
+void Rasterizer::FlushGraphicsForCompute() {
+    if (scheduler.WorkSinceSubmit() > 0 || scheduler.HasOpenUpload()) {
+        scheduler.Flush();
+    }
+}
+
+std::vector<std::pair<vk::Semaphore, u64>> Rasterizer::ComputeSubmitWaits() {
+    std::vector<std::pair<vk::Semaphore, u64>> waits;
+    if (const u64 current = scheduler.CurrentTick(); current > 0) {
+        waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(), current - 1);
+    }
+    if (const auto [sema, tick] = buffer_cache.MemoryFence(); sema && tick != 0) {
+        waits.emplace_back(sema, tick);
+    }
+    return waits;
 }
 
 void Rasterizer::DispatchDirect() {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    // Submit piled-up work before discovering/translating the next compute pipeline, so the
+    // GPU and compiler threads drain it while this thread works on the next dispatch.
+    scheduler.SubmitIfWorkPiledUp();
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -326,29 +775,122 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    // Ours: batched compute-queue route (buffers-only, push descriptors, compute rings).
+    if (IsAsyncComputeEligible(*pipeline, cs)) {
+        RouteComputeDispatch(pipeline);
         return;
     }
 
+    // Theirs: the game's compute rings run on the second queue, after the graphics work
+    // they depend on. Whether a dispatch can is known once it is bound.
+    const bool compute_ring = liverpool->IsComputeRingActive();
+    const bool try_async = async_scheduler && compute_ring && CanBindOnAsync(*pipeline);
+    const u64 commands_before = scheduler.CommandsRequested();
+    runtime.SetRecordingForAsync(try_async);
+    const bool bound = BindResources(pipeline);
+    runtime.SetRecordingForAsync(false);
+    if (!bound) {
+        return;
+    }
+    if (compute_ring) {
+        Common::Perf::Count(Common::Perf::Counter::ComputeRingDispatches);
+    }
+    if (try_async && OrderOnAsync(commands_before)) {
+        DispatchOnAsync(*pipeline, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+        return;
+    }
+
+    scheduler.MarkWorkRun(true);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Begin, cs.pgm_hash,
+                           cs_program.dim_x * cs_program.dim_y * cs_program.dim_z,
+                           !last_work_compute, liverpool->IsComputeRingActive());
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        if (!last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        // Direct dispatches only run compute shaders (no indirect-arg read), so the
+        // barrier's destination is narrowed from AllCommands: unrelated graphics stages
+        // keep flowing while particle dispatches synchronize among themselves.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eComputeShader,
+                              vk::AccessFlagBits2::eShaderRead |
+                                  vk::AccessFlagBits2::eShaderWrite);
     }
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    BindComputePipeline(*pipeline);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Start);
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::End);
     DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    if (!std::exchange(last_work_compute, true)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
+    }
+    scheduler.CountWork();
 
     ResetBindings(true);
+
+    if (try_async) {
+        // It depends on graphics work not submitted yet, and the compute ring's work after it
+        // likely depends on it: submitted, they can wait for it on the second queue.
+        scheduler.Flush();
+        Common::Perf::Count(Common::Perf::Counter::AsyncGraphicsSubmits);
+    }
+}
+
+bool Rasterizer::CanBindOnAsync(const ComputePipeline& pipeline) const {
+    // Images are laid out and transitioned for the graphics queue, and memory read through
+    // addresses isn't known. A pipeline still being built would hold up the queue.
+    const auto& cs = pipeline.GetStage(Shader::SwStage::Compute);
+    return cs.images.empty() && !cs.uses_dma && pipeline.IsReady();
+}
+
+bool Rasterizer::OrderOnAsync(u64 commands_before) {
+    if (scheduler.CommandsRequested() != commands_before || untracked_access) {
+        return false;
+    }
+    const auto* stream_buffer = &buffer_cache.GetStreamBuffer();
+    u64 dependency = 0;
+    for (const auto& [buffer, offset, size, is_written] : bound_buffers) {
+        // Stream buffer memory is only written again once the graphics queue is done with the
+        // tick it was written in, which waits for what the second queue was given meanwhile.
+        if (buffer == stream_buffer) {
+            continue;
+        }
+        dependency =
+            std::max(dependency, runtime.GraphicsDependency(buffer, offset, size, !is_written));
+    }
+    if (dependency >= scheduler.CurrentTick()) {
+        return false;
+    }
+    runtime.WaitOnGraphics(dependency);
+    return true;
+}
+
+void Rasterizer::DispatchOnAsync(const ComputePipeline& pipeline, u32 dim_x, u32 dim_y, u32 dim_z) {
+    const auto cmdbuf = runtime.AsyncCommandBuffer();
+    pipeline.BindResources(*async_scheduler, set_writes, push_data);
+    async_scheduler->GetDynamicState().BindComputePipeline(cmdbuf, pipeline.Handle());
+    cmdbuf.dispatch(dim_x, dim_y, dim_z);
+    async_scheduler->CountWork();
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    Common::Perf::Count(Common::Perf::Counter::AsyncDispatches);
+    // The graphics queue waits for the second one before it runs what is recorded next, so the
+    // accesses aren't kept for its barriers.
+    bound_images.clear();
+    bound_buffers.clear();
+    needs_barrier = false;
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     RENDERER_TRACE;
 
     scheduler.PopPendingOperations();
+    scheduler.SubmitIfWorkPiledUp();
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
@@ -362,18 +904,40 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto [buffer, base] = buffer_cache.ObtainBuffer(address + offset, size, false);
     needs_barrier |= runtime.IsBufferAccessed(buffer, base, size);
+    runtime.NoteBufferRead(buffer, base, size);
 
+    scheduler.MarkWorkRun(true);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Begin,
+                           pipeline->GetStage(Shader::SwStage::Compute).pgm_hash, 0,
+                           !last_work_compute, liverpool->IsComputeRingActive());
     if (needs_barrier) {
-        runtime.FlushBarriers();
+        if (!last_work_compute) {
+            Common::Perf::Count(Common::Perf::Counter::SwitchBarriers);
+        }
+        // Indirect dispatches read their args in the draw indirect stage (part of
+        // all graphics) and run compute: a draw reading the same memory later
+        // issues its own barrier with a graphics destination.
+        runtime.FlushBarriers(vk::PipelineStageFlagBits2::eComputeShader |
+                                  vk::PipelineStageFlagBits2::eDrawIndirect,
+                              vk::AccessFlagBits2::eShaderRead |
+                                  vk::AccessFlagBits2::eShaderWrite |
+                                  vk::AccessFlagBits2::eIndirectCommandRead);
     }
 
     scheduler.EndRendering();
     pipeline->BindResources(set_writes, push_data);
 
     const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline->Handle());
+    BindComputePipeline(*pipeline);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Start);
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
+    scheduler.MarkDispatch(Scheduler::DispatchMark::End);
     DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    if (!std::exchange(last_work_compute, true)) {
+        Common::Perf::Count(Common::Perf::Counter::WorkSwitches);
+    }
+    scheduler.CountWork();
 
     ResetBindings(true);
 }
@@ -398,6 +962,11 @@ void Rasterizer::OnSubmit() {
 
 void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
+    buffer_cache.PrefetchReadbacks();
+    if (async_scheduler && liverpool->IsComputeRingActive()) {
+        // The game is told the compute ring's work is done, and reads what it wrote next.
+        runtime.FlushAsync();
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -429,6 +998,9 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
 
     if (uses_dma) {
         buffer_cache.SynchronizeDmaBuffers();
+        // Its shaders read memory through addresses, which no access is kept for. Noted once
+        // the draw is recorded, as a submit can come in between.
+        untracked_access = true;
     }
 
     return true;
@@ -444,9 +1016,17 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
                               regs.vgt_instance_step_rate_0, regs.vgt_instance_step_rate_1);
 
     if (instance.IsVertexInputDynamicState()) {
-        // Update current vertex inputs.
-        const auto cmdbuf = scheduler.CommandBuffer();
-        cmdbuf.setVertexInputEXT(bindings, attributes);
+        // Update current vertex inputs. Draws mostly use the inputs the draw before did, and
+        // setting them again for every draw took a good part of its time in the driver.
+        auto& dirty = scheduler.GetDynamicState().dirty_state;
+        if (dirty.vertex_input || bindings != last_vertex_bindings ||
+            attributes != last_vertex_attributes) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.setVertexInputEXT(bindings, attributes);
+            last_vertex_bindings = bindings;
+            last_vertex_attributes = attributes;
+            dirty.vertex_input = false;
+        }
     }
 
     if (bindings.empty()) {
@@ -490,12 +1070,17 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         }
     }
 
-    // Map buffers for merged ranges
+    // Map buffers for merged ranges. Their reads are reported to the runtime with the bound
+    // buffers after the draw, so an upload over them waits for it.
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        bool unwritten = false;
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false);
-        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false, true, &unwritten);
+        if (!unwritten) {
+            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        }
+        bound_buffers.emplace_back(range.buffer, range.offset, static_cast<u32>(size), false);
     }
 
     // Bind vertex buffers
@@ -544,9 +1129,15 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    bool unwritten = false;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, true, &unwritten);
+    if (!unwritten) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    }
+    if (index_buffer_size != 0) {
+        bound_buffers.emplace_back(buffer, offset, index_buffer_size, false);
+    }
     const auto cmdbuf = scheduler.CommandBuffer();
     cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
 }
@@ -555,13 +1146,27 @@ void Rasterizer::ResetBindings(bool is_compute) {
     for (auto& image_id : bound_images) {
         texture_cache.GetImage(image_id).binding = {};
     }
+    const VideoCore::Buffer* stream_buffer = &buffer_cache.GetStreamBuffer();
     for (const auto [buffer, offset, size, is_written] : bound_buffers) {
+        // Stream buffer memory is only written again once the GPU is done with it, so reads of
+        // it need no tracking, and most small buffers are read from there.
+        if (buffer == stream_buffer && !is_written) {
+            continue;
+        }
         const auto dst_stage = is_compute ? vk::PipelineStageFlagBits2::eComputeShader
                                           : vk::PipelineStageFlagBits2::eAllGraphics;
         const auto write_flag =
             is_written ? vk::AccessFlagBits2::eShaderWrite : vk::AccessFlagBits2::eNone;
         runtime.AccessBuffer(buffer, offset, size, dst_stage,
                              vk::AccessFlagBits2::eShaderRead | write_flag);
+        if (is_written) {
+            // The submission being recorded wrote to GPU memory: a readback of it
+            // waits for this tick, not for the latest one.
+            buffer_cache.NoteGpuWriteTick();
+        }
+    }
+    if (std::exchange(untracked_access, false)) {
+        runtime.NoteUntrackedAccess();
     }
     bound_images.clear();
     bound_buffers.clear();
@@ -762,6 +1367,8 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 auto& lds_buffer = buffer_cache.GetStreamBuffer();
                 const auto& cs_program = liverpool->GetCsRegs();
                 const auto lds_size = cs_program.SharedMemSize() * cs_program.NumWorkgroups();
+                Common::Perf::Count(Common::Perf::Counter::SharedMemoryDispatches);
+                Common::Perf::Count(Common::Perf::Counter::SharedMemoryBytes, lds_size);
                 const auto [data, offset] = lds_buffer.Map(lds_size, alignment);
                 std::memset(data, 0, lds_size);
                 lds_buffer.Commit();
@@ -779,8 +1386,11 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                     LOG_ERROR(Render, "Clamped size from {} to {} for stage {:#x}",
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted);
+                // Accesses are reported to the runtime with the bound buffers after the draw.
+                bool unwritten = false;
+                const auto [buffer, offset] =
+                    buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
+                                              desc.is_formatted, true, &unwritten);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -793,8 +1403,16 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
+                    if (liverpool->IsComputeRingActive()) {
+                        buffer_cache.NoteComputeRingWrite(vsharp.base_address, size);
+                    }
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                // Most are small buffers read, which the buffer cache checked already. Checking
+                // them twice was most of the 100000 checks a frame in inFAMOUS Second Son.
+                if (!unwritten) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
             }
         }
 
@@ -809,22 +1427,39 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+/// The descriptor a texture binding is found with, for the given one of the bindings made for
+/// each mip level, if the shader stores to explicit ones.
+static void MakeTextureDesc(VideoCore::TextureCache::ImageDesc& desc, const AmdGpu::Image& tsharp,
+                            const Shader::ImageResource& image_desc, u32 binding_index) {
+    std::construct_at(&desc, tsharp, image_desc);
+    if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+        desc.view_info.range.base.level += image_desc.constant_mip_index;
+        desc.view_info.range.extent.levels = 1;
+    } else if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+        desc.view_info.range.base.level += binding_index;
+        desc.view_info.range.extent.levels = 1;
+    }
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
-    image_bindings.clear();
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
-    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+    // Room for as many as there can be, as programs with more than a few had them allocated on
+    // every draw.
+    boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
 
+    u32 num_images{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
-        if (texture_cache.IsMeta(tsharp.Address())) {
-            LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
-        }
-
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        const auto unbound_type = image_desc.is_written
+                                      ? VideoCore::TextureCache::BindingType::Storage
+                                      : VideoCore::TextureCache::BindingType::Texture;
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            auto& unbound = image_bindings[num_images++];
+            unbound.image_id = {};
+            unbound.type = unbound_type;
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
@@ -836,28 +1471,41 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings.emplace_back(std::piecewise_construct, std::tuple{}, std::tuple{});
+            auto& unbound = image_bindings[num_images++];
+            unbound.image_id = {};
+            unbound.type = unbound_type;
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
-        const u32 num_bindings = image_desc.NumBindings(stage);
+        // Ours: reuse the already-fetched sharp instead of fetching it twice per image per
+        // draw; theirs: invariant check for constant-mip mode.
+        const u32 num_bindings = image_desc.NumBindings(tsharp);
+        ASSERT(mip_fallback_mode != Shader::MipStorageFallbackMode::ConstantIndex ||
+               num_bindings == 1);
 
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings.emplace_back(
-                std::piecewise_construct, std::tuple{}, std::tuple{tsharp, image_desc});
-
-            if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                ASSERT(num_bindings == 1);
-                desc.view_info.range.base.level += image_desc.constant_mip_index;
-                desc.view_info.range.extent.levels = 1;
-            } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                desc.view_info.range.base.level += i;
-                desc.view_info.range.extent.levels = 1;
-            }
-
-            image_id = texture_cache.FindImage(desc);
+            auto& image_binding = image_bindings[num_images++];
+            // Everything the descriptor is built from.
+            const u32 flags = u32{image_desc.is_written} | u32{image_desc.is_depth} << 1 |
+                              u32{image_desc.is_array} << 2 |
+                              static_cast<u32>(mip_fallback_mode) << 3;
+            const u32 level = mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex
+                                  ? u32{image_desc.constant_mip_index}
+                                  : static_cast<u32>(i);
+            const auto key = MakeKey(VideoCore::TextureCache::BindingType::Texture, flags,
+                                     std::bit_cast<std::array<u32, sizeof(tsharp) / 4>>(tsharp),
+                                     std::array<u32, 1>{level});
+            const auto [found_id, found_desc] = texture_cache.FindImageCachedRef(
+                key, [&](auto& new_desc) { MakeTextureDesc(new_desc, tsharp, image_desc, i); });
+            image_binding.image_id = found_id;
+            image_binding.view_info = found_desc->view_info;
+            image_binding.type = found_desc->type;
+            image_binding.tsharp = tsharp;
+            image_binding.resource = &image_desc;
+            image_binding.level = static_cast<u32>(i);
+            auto& image_id = image_binding.image_id;
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -877,21 +1525,31 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     }
 
     // Second pass to re-bind images that were updated after binding
-    for (auto& [image_id, desc] : image_bindings) {
-        bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+    for (u32 i = 0; i < num_images; ++i) {
+        auto& image_binding = image_bindings[i];
+        auto& image_id = image_binding.image_id;
+        bool is_storage = image_binding.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
+                VideoCore::TextureCache::ImageDesc desc;
+                MakeTextureDesc(desc, image_binding.tsharp, *image_binding.resource,
+                                image_binding.level);
                 image_id = texture_cache.FindImage(desc);
+                image_binding.view_info = desc.view_info;
+                image_binding.type = desc.type;
+                is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
             }
 
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            auto& image_view =
+                texture_cache.FindTexture(image_id, image_binding.type, image_binding.view_info);
+            const auto& desc = image_binding;
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render
@@ -934,8 +1592,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage =
+            image_bindings[image_binding_idx].type == VideoCore::TextureCache::BindingType::Storage;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;
@@ -950,10 +1608,12 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
         binding.unified += array_size;
     }
 
+    const auto ta_bc_base = liverpool->regs.ta_bc_base;
+    const u64 sampler_gen = texture_cache.SamplerGeneration();
     for (const auto& sampler : stage.samplers) {
         auto ssharp = sampler.GetSharp(stage);
         if (!ssharp.Valid() || (ssharp.border_color_type.Value() == AmdGpu::BorderColor::Custom &&
-                                liverpool->regs.ta_bc_base.Address() == 0)) {
+                                ta_bc_base.Address() == 0)) {
             LOG_WARNING(Render_Vulkan,
                         "Rejecting invalid S# max_aniso={}, filter_mode={}, mip_filter={}, "
                         "border_color_type={}, border_color_base={:#x}",
@@ -961,11 +1621,29 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         static_cast<u32>(ssharp.filter_mode.Value()),
                         static_cast<u32>(ssharp.mip_filter.Value()),
                         static_cast<u32>(ssharp.border_color_type.Value()),
-                        liverpool->regs.ta_bc_base.Address());
+                        ta_bc_base.Address());
             ssharp = AmdGpu::Sampler{};
         }
-        const auto vk_sampler =
-            texture_cache.GetSampler(ssharp, liverpool->regs.ta_bc_base, sampler.is_depth);
+        vk::Sampler vk_sampler{};
+        bool memo_hit{};
+        for (const auto& memo : sampler_memos) {
+            if (memo.valid && memo.generation == sampler_gen && memo.is_depth == sampler.is_depth &&
+                memo.sharp == ssharp) {
+                vk_sampler = memo.handle;
+                memo_hit = true;
+                break;
+            }
+        }
+        if (!memo_hit) {
+            vk_sampler = texture_cache.GetSampler(ssharp, ta_bc_base, sampler.is_depth);
+            auto& memo = sampler_memos[next_sampler_memo];
+            next_sampler_memo = (next_sampler_memo + 1) % NumSamplerMemos;
+            memo.sharp = ssharp;
+            memo.is_depth = sampler.is_depth;
+            memo.generation = sampler_gen;
+            memo.handle = vk_sampler;
+            memo.valid = true;
+        }
         image_infos.emplace_back(vk_sampler, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
@@ -1223,6 +1901,15 @@ bool Rasterizer::InvalidateMemory(VAddr addr, u64 size, bool assume_locks) {
     return true;
 }
 
+void Rasterizer::InvalidateBuffersAhead(VAddr addr, u64 size) {
+    // Memory the GPU modified would have to be read back first, which costs more than the faults
+    // this saves. Images watch their pages separately, so writes to them still fault.
+    if (!IsMapped(addr, size) || buffer_cache.IsRegionGpuModified(addr, size)) {
+        return;
+    }
+    buffer_cache.InvalidateMemory(addr, size);
+}
+
 bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     if (!IsMapped(addr, size)) {
         // Not GPU mapped memory, can skip invalidation logic entirely.
@@ -1230,6 +1917,10 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
     }
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
     return true;
+}
+
+void Rasterizer::OnBackingWritten(VAddr addr, u64 size) {
+    buffer_cache.OnBackingWritten(addr, size);
 }
 
 bool Rasterizer::IsMapped(VAddr addr, u64 size) {
@@ -1268,11 +1959,23 @@ void Rasterizer::UnmapMemory(VAddr addr, u64 size) {
 }
 
 void Rasterizer::UpdateDynamicState(const GraphicsPipeline* pipeline, const bool is_indexed) const {
-    UpdateViewportScissorState();
-    UpdateDepthStencilState();
-    UpdatePrimitiveState(is_indexed);
-    UpdateRasterizationState();
-    UpdateColorBlendingState(pipeline);
+    // Draws mostly come with the state the draw before them set, and building it again from the
+    // registers for each was a part of every draw. The dynamic state keeps what it was set to,
+    // and sets it again in a new command buffer.
+    const DynamicStateInputs inputs{
+        .regs_version = liverpool->context_regs_version,
+        .write_masks = pipeline->GetGraphicsKey().write_masks,
+        .feedback_loop = attachment_feedback_loop,
+        .is_indexed = is_indexed,
+    };
+    if (inputs != last_dynamic_inputs) {
+        UpdateViewportScissorState();
+        UpdateDepthStencilState();
+        UpdatePrimitiveState(is_indexed);
+        UpdateRasterizationState();
+        UpdateColorBlendingState(pipeline);
+        last_dynamic_inputs = inputs;
+    }
 
     auto& dynamic_state = scheduler.GetDynamicState();
     dynamic_state.Commit(instance, scheduler.CommandBuffer());
@@ -1409,6 +2112,100 @@ void Rasterizer::UpdateViewportScissorState() const {
     dynamic_state.SetScissors(scissors);
 }
 
+struct StencilFaceState {
+    vk::StencilOp fail_op;
+    vk::StencilOp pass_op;
+    vk::StencilOp depth_fail_op;
+    u32 reference;
+};
+
+// GCN has separate stencil test (STENCILTESTVAL) and replace (STENCILOPVAL) values, while a Vulkan
+// face has a single reference for both. Finds a reference that keeps the test exact and still
+// writes what every replacing op should, turning such ops into equivalent ones (zero, keep,
+// invert, increment, decrement) where the stencil value is known. Returns nullopt if it can't.
+static std::optional<StencilFaceState> ResolveStencilFace(AmdGpu::CompareFunc func,
+                                                          const AmdGpu::StencilRefMask& ref,
+                                                          u32 write_mask, AmdGpu::StencilFunc fail,
+                                                          AmdGpu::StencilFunc zpass,
+                                                          AmdGpu::StencilFunc zfail) {
+    using AmdGpu::CompareFunc;
+    using AmdGpu::StencilFunc;
+    const u32 test_val = ref.stencil_test_val;
+    const u32 compare_mask = ref.stencil_mask;
+    write_mask &= 0xFF;
+    const bool test_uses_reference = func != CompareFunc::Always && func != CompareFunc::Never;
+
+    const auto written_value = [&](StencilFunc op) -> std::optional<u32> {
+        switch (op) {
+        case StencilFunc::ReplaceTest:
+            return test_val;
+        case StencilFunc::ReplaceOp:
+            return ref.stencil_op_val;
+        case StencilFunc::Ones:
+            return 0xFFU;
+        default:
+            return std::nullopt;
+        }
+    };
+
+    // An EQUAL test that passed, or a NOTEQUAL test that failed, means the stencil value matches
+    // test_val in the compared bits, which is enough to know what a write will change.
+    const bool written_bits_compared = (write_mask & ~compare_mask) == 0;
+    const bool whole_value_known = compare_mask == 0xFF && write_mask == 0xFF;
+    const bool known_on_pass = func == CompareFunc::Equal && written_bits_compared;
+    const bool known_on_fail = func == CompareFunc::NotEqual && written_bits_compared;
+
+    const auto resolve = [&](StencilFunc op, u32 reference,
+                             bool value_known) -> std::optional<vk::StencilOp> {
+        const auto value = written_value(op);
+        if (!value) {
+            return LiverpoolToVK::StencilOp(op);
+        }
+        const u32 target = *value & write_mask;
+        if (target == (reference & write_mask)) {
+            return vk::StencilOp::eReplace;
+        }
+        if (target == 0) {
+            return vk::StencilOp::eZero;
+        }
+        if (value_known) {
+            if (target == (test_val & write_mask)) {
+                return vk::StencilOp::eKeep;
+            }
+            if (target == (~test_val & write_mask)) {
+                return vk::StencilOp::eInvert;
+            }
+            if (whole_value_known && *value == ((test_val + 1) & 0xFF)) {
+                return vk::StencilOp::eIncrementAndWrap;
+            }
+            if (whole_value_known && *value == ((test_val - 1) & 0xFF)) {
+                return vk::StencilOp::eDecrementAndWrap;
+            }
+        }
+        return std::nullopt;
+    };
+
+    // Try each written value as the reference. When the test reads the reference, its compared
+    // bits must stay those of test_val, and only the rest can carry the written value.
+    const std::array<std::optional<u32>, 4> candidates = {
+        written_value(zpass), written_value(zfail), written_value(fail), test_val};
+    for (const auto& candidate : candidates) {
+        if (!candidate) {
+            continue;
+        }
+        const u32 reference = test_uses_reference
+                                  ? (test_val & compare_mask) | (*candidate & ~compare_mask & 0xFF)
+                                  : *candidate;
+        const auto fail_op = resolve(fail, reference, known_on_fail);
+        const auto pass_op = resolve(zpass, reference, known_on_pass);
+        const auto depth_fail_op = resolve(zfail, reference, known_on_pass);
+        if (fail_op && pass_op && depth_fail_op) {
+            return StencilFaceState{*fail_op, *pass_op, *depth_fail_op, reference};
+        }
+    }
+    return std::nullopt;
+}
+
 void Rasterizer::UpdateDepthStencilState() const {
     const auto& regs = liverpool->regs;
     auto& dynamic_state = scheduler.GetDynamicState();
@@ -1442,53 +2239,59 @@ void Rasterizer::UpdateDepthStencilState() const {
         regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
-        const StencilOps front_ops{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_front),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_front),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_front),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_ref_func),
-        };
-        const StencilOps back_ops = regs.depth_control.backface_enable ? StencilOps{
-            .fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_fail_back),
-            .pass_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zpass_back),
-            .depth_fail_op = LiverpoolToVK::StencilOp(regs.stencil_control.stencil_zfail_back),
-            .compare_op = LiverpoolToVK::CompareOp(regs.depth_control.stencil_bf_func),
-        } : front_ops;
-        dynamic_state.SetStencilOps(front_ops, back_ops);
-
         const bool stencil_clear = regs.depth_render_control.stencil_clear_enable;
         const auto front = regs.stencil_ref_front;
         const auto back =
             regs.depth_control.backface_enable ? regs.stencil_ref_back : regs.stencil_ref_front;
-        // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so a face whose stencil ops
-        // include ReplaceOp takes its Vulkan reference from op_val.
+        const u32 front_write_mask = !stencil_clear ? front.stencil_write_mask : 0U;
+        const u32 back_write_mask = !stencil_clear ? back.stencil_write_mask : 0U;
+
+        const auto setup_face = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref,
+                                   u32 write_mask, AmdGpu::StencilFunc fail,
+                                   AmdGpu::StencilFunc zpass,
+                                   AmdGpu::StencilFunc zfail) -> std::pair<StencilOps, u32> {
+            if (const auto face = ResolveStencilFace(func, ref, write_mask, fail, zpass, zfail)) {
+                return {StencilOps{
+                            .fail_op = face->fail_op,
+                            .pass_op = face->pass_op,
+                            .depth_fail_op = face->depth_fail_op,
+                            .compare_op = LiverpoolToVK::CompareOp(func),
+                        },
+                        face->reference};
+            }
+            // GCN REPLACE_OP writes DB_STENCILREFMASK.STENCILOPVAL, so when both values can't be
+            // honored a face whose stencil ops include ReplaceOp takes its reference from op_val.
+            const bool uses_op_val = fail == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zpass == AmdGpu::StencilFunc::ReplaceOp ||
+                                     zfail == AmdGpu::StencilFunc::ReplaceOp;
+            const u32 reference = uses_op_val ? ref.stencil_op_val : ref.stencil_test_val;
+            LOG_WARNING(Render_Vulkan,
+                        "Stencil func {} test_val {:#x} mask {:#x} can't be combined with ops "
+                        "{}/{}/{} op_val {:#x} write mask {:#x}; using reference {:#x}",
+                        static_cast<u32>(func), ref.stencil_test_val, ref.stencil_mask,
+                        static_cast<u32>(fail), static_cast<u32>(zpass), static_cast<u32>(zfail),
+                        ref.stencil_op_val, write_mask, reference);
+            return {StencilOps{
+                        .fail_op = LiverpoolToVK::StencilOp(fail),
+                        .pass_op = LiverpoolToVK::StencilOp(zpass),
+                        .depth_fail_op = LiverpoolToVK::StencilOp(zfail),
+                        .compare_op = LiverpoolToVK::CompareOp(func),
+                    },
+                    reference};
+        };
+
         const auto& sc = regs.stencil_control;
-        const auto uses_op_val = [](AmdGpu::StencilFunc fail, AmdGpu::StencilFunc zpass,
-                                    AmdGpu::StencilFunc zfail) {
-            return fail == AmdGpu::StencilFunc::ReplaceOp ||
-                   zpass == AmdGpu::StencilFunc::ReplaceOp ||
-                   zfail == AmdGpu::StencilFunc::ReplaceOp;
-        };
-        const bool front_op =
-            uses_op_val(sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
-        const bool back_op =
+        const auto [front_ops, front_reference] =
+            setup_face(regs.depth_control.stencil_ref_func, front, front_write_mask,
+                       sc.stencil_fail_front, sc.stencil_zpass_front, sc.stencil_zfail_front);
+        const auto [back_ops, back_reference] =
             regs.depth_control.backface_enable
-                ? uses_op_val(sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
-                : front_op;
-        const auto ref_conflict = [](AmdGpu::CompareFunc func, const AmdGpu::StencilRefMask& ref) {
-            return func != AmdGpu::CompareFunc::Always && func != AmdGpu::CompareFunc::Never &&
-                   ref.stencil_test_val != ref.stencil_op_val;
-        };
-        if ((front_op && ref_conflict(regs.depth_control.stencil_ref_func, front)) ||
-            (back_op && regs.depth_control.backface_enable &&
-             ref_conflict(regs.depth_control.stencil_bf_func, back))) {
-            LOG_WARNING(Render_Vulkan, "Stencil test requires test_val while ReplaceOp requires "
-                                       "op_val; the stencil test will use op_val");
-        }
-        dynamic_state.SetStencilReferences(front_op ? front.stencil_op_val : front.stencil_test_val,
-                                           back_op ? back.stencil_op_val : back.stencil_test_val);
-        dynamic_state.SetStencilWriteMasks(!stencil_clear ? front.stencil_write_mask : 0U,
-                                           !stencil_clear ? back.stencil_write_mask : 0U);
+                ? setup_face(regs.depth_control.stencil_bf_func, back, back_write_mask,
+                             sc.stencil_fail_back, sc.stencil_zpass_back, sc.stencil_zfail_back)
+                : std::pair{front_ops, front_reference};
+        dynamic_state.SetStencilOps(front_ops, back_ops);
+        dynamic_state.SetStencilReferences(front_reference, back_reference);
+        dynamic_state.SetStencilWriteMasks(front_write_mask, back_write_mask);
         dynamic_state.SetStencilCompareMasks(front.stencil_mask, back.stencil_mask);
     }
 }

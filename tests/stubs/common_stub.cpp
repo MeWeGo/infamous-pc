@@ -7,4 +7,10 @@ namespace Common {
 
 std::string GetCurrentThreadName() { return "shadPS4::Test"; }
 
+void SetCurrentThreadName(const char*) {}
+
+namespace Perf {
+unsigned long long FrameNumber() { return 0; }
+} // namespace Perf
+
 } // namespace Common

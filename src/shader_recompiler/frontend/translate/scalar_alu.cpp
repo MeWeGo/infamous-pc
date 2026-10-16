@@ -100,8 +100,21 @@ void Translator::EmitScalarAlu(const GcnInst& inst) {
             return S_MOV_B64(inst);
         case Opcode::S_NOT_B64:
             return S_NOT_B64(inst);
-        case Opcode::S_WQM_B64:
-            break;
+        case Opcode::S_WQM_B64: {
+            if (inst.dst[0].field == OperandField::ExecLo &&
+                inst.src[0].field == OperandField::ExecLo) {
+                break;
+            }
+            const IR::U1 bit{ir.InverseBallot(GetSrc64(inst.src[0]))};
+            const IR::U32 v{ir.Select(bit, ir.Imm32(1u), ir.Imm32(0u))};
+            const IR::U32 quad{ir.BitwiseOr(
+                ir.BitwiseOr(ir.QuadBroadcast(v, ir.Imm32(0u)), ir.QuadBroadcast(v, ir.Imm32(1u))),
+                ir.BitwiseOr(ir.QuadBroadcast(v, ir.Imm32(2u)), ir.QuadBroadcast(v, ir.Imm32(3u))))};
+            const IR::U64 mask{ir.Ballot(ir.INotEqual(quad, ir.Imm32(0u)))};
+            SetDst64(inst.dst[0], mask);
+            ir.SetScc(ir.InverseBallot(mask));
+            return;
+        }
         case Opcode::S_BREV_B32:
             return S_BREV_B32(inst);
         case Opcode::S_BCNT1_I32_B32:

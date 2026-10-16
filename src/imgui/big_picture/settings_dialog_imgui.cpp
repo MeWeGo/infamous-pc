@@ -32,8 +32,14 @@ int SettingsWindow::GetComboIndex(std::string selection, std::vector<std::string
 }
 
 void SettingsWindow::LoadSettings(std::string profile) {
+    // Global-only settings
+    EmulatorSettings.Load();
+    scanDepthSetting = EmulatorSettings.GetBigPictureFolderDepth();
+
     const bool isSpecific = currentProfile != "Global";
-    isSpecific ? EmulatorSettings.Load(profile) : EmulatorSettings.Load();
+    if (isSpecific) {
+        EmulatorSettings.Load(profile);
+    }
 
     /////////// General Tab
     int languageIndex = EmulatorSettings.GetConsoleLanguage();
@@ -43,7 +49,6 @@ void SettingsWindow::LoadSettings(std::string profile) {
             language = key;
         }
     }
-
     consoleLanguageSetting = GetComboIndex(language, languageOptions);
     volumeSetting = EmulatorSettings.GetVolumeSlider();
     showSplashSetting = EmulatorSettings.IsShowSplash();
@@ -88,6 +93,11 @@ void SettingsWindow::LoadSettings(std::string profile) {
         shadnetEnabledSetting = EmulatorSettings.IsShadNetEnabledSetting();
         connectedNetworkSetting = EmulatorSettings.IsConnectedToNetwork();
         pipelineCacheEnabledSetting = EmulatorSettings.IsPipelineCacheEnabled();
+        asyncShaderCompileSetting = EmulatorSettings.IsAsyncShaderCompile();
+        threadedCommandRecordingSetting = EmulatorSettings.IsThreadedCommandRecording();
+        uploadThreadSetting = EmulatorSettings.IsUploadThread();
+        syncLargeReadsOnceSetting = EmulatorSettings.IsSyncLargeReadsOnce();
+        asyncComputeSetting = EmulatorSettings.IsAsyncCompute();
         pipelineCacheArchiveSetting = EmulatorSettings.IsPipelineCacheArchived();
         extraDmemSetting = EmulatorSettings.GetExtraDmemInMBytes();
         vblankFrequencySetting = EmulatorSettings.GetVblankFrequency();
@@ -145,6 +155,11 @@ void SettingsWindow::SaveSettings(std::string profile) {
         EmulatorSettings.SetShadNetEnabled(shadnetEnabledSetting, true);
         EmulatorSettings.SetConnectedToNetwork(connectedNetworkSetting, true);
         EmulatorSettings.SetPipelineCacheEnabled(pipelineCacheEnabledSetting, true);
+        EmulatorSettings.SetAsyncShaderCompile(asyncShaderCompileSetting, true);
+        EmulatorSettings.SetThreadedCommandRecording(threadedCommandRecordingSetting, true);
+        EmulatorSettings.SetUploadThread(uploadThreadSetting, true);
+        EmulatorSettings.SetSyncLargeReadsOnce(syncLargeReadsOnceSetting, true);
+        EmulatorSettings.SetAsyncCompute(asyncComputeSetting, true);
         EmulatorSettings.SetPipelineCacheArchived(pipelineCacheArchiveSetting, true);
         EmulatorSettings.SetExtraDmemInMBytes(extraDmemSetting, true);
         EmulatorSettings.SetVblankFrequency(vblankFrequencySetting, true);
@@ -513,8 +528,10 @@ void SettingsWindow::DrawProfileSelector() {
             }
 
             ImGui::TableNextColumn();
-            std::string profileLabel =
-                i == 0 ? "Global" : profileIcons[i].serial + " - " + profileIcons[i].title;
+            std::string profileLabel = i == 0
+                                           ? "Global"
+                                           : profileIcons[i].serial + " - " +
+                                                 profileIcons[i].title + "##" + std::to_string(i);
             if (ImGui::Button(profileLabel.c_str(),
                               ImVec2(ImGui::GetContentRegionAvail().x, 0.0f))) {
 
@@ -594,6 +611,29 @@ void SettingsWindow::DrawGameFolderManager() {
         ImGui::SetNextWindowPos(viewport->Pos);
         ImGui::SetNextWindowSize(viewport->Size);
     }
+
+    float buttonWidth = ImGui::GetItemRectSize().x;
+    ImGui::PushItemWidth(buttonWidth);
+    if (ImGui::SliderInt("Folder Scan Depth", &scanDepthSetting, 0, 5)) {
+        std::string profile;
+        const bool isGlobal = currentProfile == "Global";
+        if (!isGlobal) {
+            profile = currentProfile.substr(0, 9);
+            EmulatorSettings.Load();
+        }
+
+        EmulatorSettings.SetBigPictureFolderDepth(scanDepthSetting);
+        EmulatorSettings.Save();
+
+        if (!isGlobal) {
+            EmulatorSettings.Load(profile);
+        }
+
+        if (!isGameRunning) {
+            GetProfileInfo();
+        }
+    }
+    ImGui::PopItemWidth();
 
     if (ImGuiFileDialog::Instance()->Display("OpenFolder", child_flags | ImGuiWindowFlags_NoMove)) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -742,7 +782,6 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("Enable Logging", logEnableSetting);
             if (logEnableSetting) {
                 AddSettingCheckbox("Separate Log Files", logSeparateSetting);
-                AddSettingCheckbox("Log Sync", logSyncSetting);
             }
 
             ImGui::EndTable();
@@ -766,8 +805,15 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("Enable PS4 Neo Mode", neoModeSetting);
             AddSettingCheckbox("Enable ShadNet", shadnetEnabledSetting);
             AddSettingCheckbox("Set Network Connected to True", connectedNetworkSetting);
+            AddSettingCheckbox("Asynchronous Shader Compilation", asyncShaderCompileSetting);
+            AddSettingCheckbox("Record GPU Commands on a Separate Thread",
+                               threadedCommandRecordingSetting);
+            AddSettingCheckbox("Copy Uploads on a Separate Thread", uploadThreadSetting);
+            AddSettingCheckbox("Upload Large Buffers Once Between Waits",
+                               syncLargeReadsOnceSetting);
+            AddSettingCheckbox("Run Compute Rings on a Second Queue (Experimental)",
+                               asyncComputeSetting);
             AddSettingCheckbox("Enable Shader Cache", pipelineCacheEnabledSetting);
-
             if (pipelineCacheEnabledSetting) {
                 AddSettingCheckbox("Compress Shader Cache to Zip File",
                                    pipelineCacheArchiveSetting);

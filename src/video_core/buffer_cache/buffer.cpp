@@ -101,6 +101,18 @@ void UniqueBuffer::Create(vk::BufferCreateInfo& buffer_ci, MemoryType mem_type,
         VkBuffer unsafe_buffer{};
         VkResult result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &alloc_ci, &unsafe_buffer,
                                           &allocation, out_alloc_info);
+        if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+            // The budget shrinks as other programs take video memory, and going over it ended
+            // the game. Past it the driver moves memory out to system memory instead.
+            LOG_WARNING(Render_Vulkan,
+                        "Allocating a buffer of {} bytes went over the memory "
+                        "budget, allocating it past the budget",
+                        buffer_ci.size);
+            VmaAllocationCreateInfo over_budget_ci = alloc_ci;
+            over_budget_ci.flags &= ~VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT;
+            result = vmaCreateBuffer(allocator, &buffer_ci_unsafe, &over_budget_ci, &unsafe_buffer,
+                                     &allocation, out_alloc_info);
+        }
         ASSERT_MSG(result == VK_SUCCESS, "Failed allocating buffer with error {}",
                    vk::to_string(vk::Result{result}));
         buffer = vk::Buffer{unsafe_buffer};
@@ -258,6 +270,7 @@ void StreamBuffer::AdvanceAndWatch() {
     auto& watch = current_watches[current_watch_cursor++];
     watch.upper_bound = offset;
     watch.tick = tick;
+    watch.compute_tick = pending_compute_tick;
 }
 
 void StreamBuffer::ReserveWatches(std::vector<Watch>& watches, std::size_t grow_size) {
@@ -274,6 +287,11 @@ bool StreamBuffer::WaitPendingOperations(u64 requested_upper_bound, bool allow_w
             return false;
         }
         scheduler.Wait(watch.tick);
+        if (watch.compute_tick != 0 && compute_waiter) {
+            if (!compute_waiter(watch.compute_tick, allow_wait)) {
+                return false;
+            }
+        }
         wait_bound = watch.upper_bound;
         ++wait_cursor;
     }

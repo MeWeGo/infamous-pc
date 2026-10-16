@@ -8,6 +8,7 @@
 #include "common/assert.h"
 #include "common/debug.h"
 #include "common/types.h"
+#include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
 #include "sdl_window.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
@@ -347,6 +348,21 @@ bool Instance::CreateDevice() {
     }
     image_view_min_lod = add_extension(VK_EXT_IMAGE_VIEW_MIN_LOD_EXTENSION_NAME);
     supports_memory_budget = add_extension(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
+    // Lets the driver move device memory out to system memory instead of failing an allocation
+    // when the card is full, which a 4 GB card is with this game.
+    const bool memory_priority = add_extension(VK_EXT_MEMORY_PRIORITY_EXTENSION_NAME);
+    const bool pageable_extension =
+        memory_priority && add_extension(VK_EXT_PAGEABLE_DEVICE_LOCAL_MEMORY_EXTENSION_NAME);
+    if (pageable_extension) {
+        const auto pageable_chain = physical_device.getFeatures2<
+            vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceMemoryPriorityFeaturesEXT,
+            vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+        pageable_device_local_memory =
+            pageable_chain.get<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>().memoryPriority &&
+            pageable_chain.get<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>()
+                .pageableDeviceLocalMemory;
+        LOG_INFO(Render_Vulkan, "- pageableDeviceLocalMemory: {}", pageable_device_local_memory);
+    }
     shader_clock = add_extension(VK_KHR_SHADER_CLOCK_EXTENSION_NAME);
     if (shader_clock) {
         shader_clock_features = feature_chain.get<vk::PhysicalDeviceShaderClockFeaturesKHR>();
@@ -360,6 +376,12 @@ bool Instance::CreateDevice() {
     if (family_properties.empty()) {
         LOG_CRITICAL(Render_Vulkan, "Physical device reported no queues.");
         return false;
+    }
+    for (std::size_t i = 0; i < family_properties.size(); i++) {
+        const auto& props = family_properties[i];
+        LOG_INFO(Render_Vulkan, "Queue family {}: flags={} count={} timestampValidBits={}",
+                 i, vk::to_string(props.queueFlags), props.queueCount,
+                 props.timestampValidBits);
     }
 
     bool graphics_queue_found = false;
@@ -376,10 +398,26 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    static constexpr std::array queue_priorities = {1.0f};
+    // A second queue in the same family runs compute work beside the graphics work
+    // without queue family ownership transfers. Falls back to no second queue.
+    compute_queue_family_index = ~0u;
+    u32 compute_queue_index = 0;
+    if (family_properties[queue_family_index].queueCount >= 2) {
+        compute_queue_family_index = queue_family_index;
+        compute_queue_index = 1;
+    }
+    compute_queue_index_ = compute_queue_index;
+
+    // A second queue of the family runs the work of the game's compute rings beside the graphics
+    // work, if asked for. Queues of one family share resources without transfers of ownership.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f};
+    const bool second_queue =
+        EmulatorSettings.IsAsyncCompute() && family_properties[queue_family_index].queueCount > 1;
+    const u32 graphics_queue_count =
+        (compute_queue_family_index == queue_family_index || second_queue) ? 2u : 1u;
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
-        .queueCount = static_cast<u32>(queue_priorities.size()),
+        .queueCount = graphics_queue_count,
         .pQueuePriorities = queue_priorities.data(),
     };
 
@@ -446,6 +484,7 @@ bool Instance::CreateDevice() {
         },
         vk::PhysicalDeviceVulkan13Features{
             .robustImageAccess = vk13_features.robustImageAccess,
+            .pipelineCreationCacheControl = vk13_features.pipelineCreationCacheControl,
             .shaderDemoteToHelperInvocation = vk13_features.shaderDemoteToHelperInvocation,
             .subgroupSizeControl = vk13_features.subgroupSizeControl,
             .synchronization2 = vk13_features.synchronization2,
@@ -526,6 +565,12 @@ bool Instance::CreateDevice() {
         vk::PhysicalDeviceShaderClockFeaturesKHR{
             .shaderSubgroupClock = shader_clock_features.shaderSubgroupClock,
         },
+        vk::PhysicalDeviceMemoryPriorityFeaturesEXT{
+            .memoryPriority = true,
+        },
+        vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT{
+            .pageableDeviceLocalMemory = true,
+        },
     };
 
     if (!custom_border_color) {
@@ -577,6 +622,10 @@ bool Instance::CreateDevice() {
     if (!shader_clock) {
         device_chain.unlink<vk::PhysicalDeviceShaderClockFeaturesKHR>();
     }
+    if (!pageable_device_local_memory) {
+        device_chain.unlink<vk::PhysicalDeviceMemoryPriorityFeaturesEXT>();
+        device_chain.unlink<vk::PhysicalDevicePageableDeviceLocalMemoryFeaturesEXT>();
+    }
 
     auto [device_result, dev] = physical_device.createDeviceUnique(device_chain.get());
     if (device_result != vk::Result::eSuccess) {
@@ -589,6 +638,18 @@ bool Instance::CreateDevice() {
 
     graphics_queue = device->getQueue(queue_family_index, 0);
     present_queue = device->getQueue(queue_family_index, 0);
+    if (compute_queue_family_index != ~0u) {
+        compute_queue = device->getQueue(compute_queue_family_index, compute_queue_index_);
+        LOG_INFO(Render_Vulkan, "Compute queue: family {} index {}", compute_queue_family_index,
+                 compute_queue_index_);
+    } else {
+        LOG_INFO(Render_Vulkan, "No second compute queue available, compute stays serialized");
+    }
+    if (second_queue) {
+        async_queue = device->getQueue(queue_family_index, 1);
+    }
+    LOG_INFO(Render_Vulkan, "Queues in the graphics family: {}, second queue for compute rings: {}",
+             family_properties[queue_family_index].queueCount, second_queue);
 
     if (calibrated_timestamps) {
         const auto [time_domains_result, time_domains] =

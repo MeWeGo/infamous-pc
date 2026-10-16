@@ -5,7 +5,10 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/perf_profiler.h"
 #include "common/polyfill_thread.h"
+#include "common/sampling_profiler.h"
+#include "common/scope_exit.h"
 #include "common/thread.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
@@ -30,6 +33,10 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 #define NAME_ARRAY(name, num) {BOOST_PP_REPEAT(num, NAME_NUM, name)}
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
+
+/// Dwords ahead of the packet being processed to bring into the cache. Prefetching never faults,
+/// so going past the end of the commands is harmless.
+static constexpr size_t PrefetchDistance = 64;
 
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
@@ -91,6 +98,11 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    // This thread limits the frame rate in heavy scenes, so log where its time goes.
+    Common::Perf::SampleCurrentThread("gpu");
+    SCOPE_EXIT {
+        Common::Perf::StopSamplingCurrentThread();
+    };
     gpu_id = std::this_thread::get_id();
 #ifdef __linux__
     gpu_tid = gettid();
@@ -106,11 +118,13 @@ void Liverpool::Process(std::stop_token stoken) {
             break;
         }
 
+        Common::Perf::ScopedStall busy{Common::Perf::Stall::GpuThread};
         VideoCore::StartCapture();
 
         curr_qid = -1;
 
         while (num_submits || num_commands) {
+            busy.Checkpoint(std::chrono::milliseconds{1});
             ProcessCommands();
 
             curr_qid = (curr_qid + 1) % num_mapped_queues;
@@ -220,6 +234,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
+    ++sync_count;
 
     cblock.Reset();
 
@@ -236,6 +251,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
+        // The game just wrote the commands, on another core, and the work for each draw pushes
+        // them out of the caches before the next is read: waiting for them was 1% of this
+        // thread. The ones a few packets on are asked for while this one is worked on.
+        __builtin_prefetch(dcb.data() + PrefetchDistance);
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -305,13 +324,14 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             }
             case PM4ItOpcode::ClearState: {
                 regs.SetDefaults();
+                ++context_regs_version;
                 break;
             }
             case PM4ItOpcode::SetConfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
                 const auto reg_addr = Regs::ConfigRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                SetContextRegs(reg_addr, payload, count - 1);
                 break;
             }
             case PM4ItOpcode::SetContextReg: {
@@ -319,7 +339,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 const auto reg_addr = Regs::ContextRegWordOffset + set_data->reg_offset;
                 const auto* payload = reinterpret_cast<const u32*>(header + 2);
 
-                std::memcpy(&regs.reg_array[reg_addr], payload, (count - 1) * sizeof(u32));
+                SetContextRegs(reg_addr, payload, count - 1);
 
                 // In the case of HW, render target memory has alignment as color block operates on
                 // tiles. There is no information of actual resource extents stored in CB context
@@ -396,17 +416,17 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ASSERT(set_size <= sizeof(ComputeProgram));
                     auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
                                  (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
+                    CopyRegs(addr, reinterpret_cast<const u32*>(header + 2), count - 1);
                 } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
+                    CopyRegs(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
+                             reinterpret_cast<const u32*>(header + 2), count - 1);
                 }
                 break;
             }
             case PM4ItOpcode::SetUconfigReg: {
                 const auto* set_data = reinterpret_cast<const PM4CmdSetData*>(header);
-                std::memcpy(&regs.reg_array[Regs::UconfigRegWordOffset + set_data->reg_offset],
-                            header + 2, (count - 1) * sizeof(u32));
+                SetContextRegs(Regs::UconfigRegWordOffset + set_data->reg_offset,
+                               reinterpret_cast<const u32*>(header + 2), count - 1);
                 break;
             }
             case PM4ItOpcode::SetPredication: {
@@ -643,12 +663,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
-                        static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         u64* results = event->Address<u64*>();
                         for (s32 i = 0; i < num_counter_pairs; ++i, results += 2) {
-                            *results = pixel_counter | OcclusionCounterValidMask;
+                            results[0] = OcclusionCounterValidMask;
+                            results[1] = OcclusionCounterValidMask;
                         }
-                        pixel_counter += OcclusionCounterStep;
                     }
                 }
                 break;
@@ -658,9 +677,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->OnFence();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
+                event_eos->SignalFence([this](void* address, u64 data, u32 num_bytes) {
                     auto* memory = Core::Memory::Instance();
                     ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                    if (rasterizer) {
+                        rasterizer->OnBackingWritten(reinterpret_cast<VAddr>(address), num_bytes);
+                    }
                 });
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
@@ -678,9 +700,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     rasterizer->OnFence();
                 }
                 event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
+                    [this](void* address, u64 data, u32 num_bytes) {
                         auto* memory = Core::Memory::Instance();
                         ASSERT(memory->TryWriteBacking(address, &data, num_bytes));
+                        if (rasterizer) {
+                            rasterizer->OnBackingWritten(reinterpret_cast<VAddr>(address),
+                                                         num_bytes);
+                        }
                     },
                     [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
@@ -752,9 +778,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    ++sync_count;
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
                     }
+                    ++sync_count;
                     mem_semaphore->Decrement();
                 }
                 break;
@@ -768,27 +796,39 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                ++sync_count;
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
+                ++sync_count;
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
+                ++sync_count;
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+                if (wait_reg_mem->Test(regs.reg_array)) {
+                    break;
+                }
+                const u64* wait_addr = wait_reg_mem->Address<u64*>();
+                // Waiting on a VO label is waiting on presentation, anything else on the game.
+                Common::Perf::ScopedStall wait{vo_port->IsVoLabel(wait_addr)
+                                                   ? Common::Perf::Stall::FrameWait
+                                                   : Common::Perf::Stall::GuestWait};
                 // Optimization: VO label waits are special because the emulator
                 // will write to the label when presentation is finished. So if
                 // there are no other submits to yield to we can sleep the thread
                 // instead and allow other tasks to run.
-                const u64* wait_addr = wait_reg_mem->Address<u64*>();
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    ++sync_count;
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     YIELD_GFX();
                 }
+                ++sync_count;
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
@@ -801,6 +841,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     YIELD_GFX();
                     RESUME_GFX(task);
                 }
+                task.handle.destroy();
                 break;
             }
             case PM4ItOpcode::IncrementDeCounter: {
@@ -865,6 +906,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    ++sync_count;
     auto& queue = asc_queues[{vqid}];
 
     struct IndirectPatch {
@@ -877,6 +919,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        __builtin_prefetch(acb.data() + PrefetchDistance);
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -935,6 +978,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 YIELD_ASC(vqid);
                 RESUME_ASC(task, vqid);
             }
+            task.handle.destroy();
             break;
         }
         case PM4ItOpcode::DmaData: {
@@ -991,9 +1035,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            ++sync_count;
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
+            ++sync_count;
             break;
         }
         case PM4ItOpcode::SetShReg: {
@@ -1005,10 +1051,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 ASSERT(set_size <= sizeof(ComputeProgram));
                 auto* addr = reinterpret_cast<u32*>(&mapped_queues[vqid + 1].cs_state) +
                              (set_data->reg_offset - 0x200);
-                std::memcpy(addr, header + 2, set_size);
+                CopyRegs(addr, reinterpret_cast<const u32*>(header + 2),
+                         header->type3.NumWords() - 1);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
+                CopyRegs(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
+                         reinterpret_cast<const u32*>(header + 2), header->type3.NumWords() - 1);
             }
             break;
         }
@@ -1082,19 +1129,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                ++sync_count;
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
+                ++sync_count;
                 mem_semaphore->Decrement();
             }
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            ++sync_count;
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
+            ++sync_count;
             break;
         }
         case PM4ItOpcode::ReleaseMem: {
