@@ -88,7 +88,14 @@ public:
     }
 
     using DescriptorWrites = std::vector<vk::WriteDescriptorSet>;
-    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const;
+    void BindResources(DescriptorWrites& set_writes, const Shader::PushData& push_data) const {
+        BindResources(scheduler, set_writes, push_data);
+    }
+
+    /// Binds the resources for work recorded with the given scheduler, such as the one of the
+    /// second queue.
+    void BindResources(Scheduler& target, DescriptorWrites& set_writes,
+                       const Shader::PushData& push_data) const;
 
 protected:
     [[nodiscard]] std::string GetDebugString() const;
@@ -100,6 +107,11 @@ protected:
     /// Logs a finished driver compile and accounts for it if it held up the thread.
     void LogPipelineCreation(std::string_view kind, std::string_view debug_str,
                              std::chrono::steady_clock::time_point start) const;
+
+    /// Returns true if creating a pipeline should be tried again after it failed with the result
+    /// on the attempt, counted from 1, having waited a little for the driver to recover.
+    static bool RetryPipelineCreation(vk::Result result, u32 attempt, std::string_view kind,
+                                      std::string_view debug_str);
 
     /// Replaces a pipeline built without optimizations with the optimized one built since.
     void SwapInOptimized() const;

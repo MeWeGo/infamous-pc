@@ -89,6 +89,11 @@ public:
         return present_queue;
     }
 
+    /// Returns the second queue of the graphics family the game's compute rings run on, or null.
+    vk::Queue GetAsyncQueue() const {
+        return async_queue;
+    }
+
     TracyVkCtx GetProfilerContext() const {
         return profiler_context;
     }
@@ -521,6 +526,7 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    vk::Queue async_queue;
     vk::Queue graphics_queue;
     vk::Queue compute_queue{};
     u32 compute_queue_family_index{~0u};
@@ -556,6 +562,7 @@ private:
     bool image_view_min_lod{};
     bool shader_clock{};
     bool supports_memory_budget{};
+    bool pageable_device_local_memory{};
     bool supports_block_texel_view{};
     u64 total_memory_budget{};
     std::vector<size_t> valid_heaps;

@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <thread>
 #include <boost/container/static_vector.hpp>
 
 #include "common/perf_profiler.h"
@@ -68,15 +69,34 @@ void Pipeline::LogPipelineCreation(std::string_view kind, std::string_view debug
     }
 }
 
-void Pipeline::BindResources(DescriptorWrites& set_writes,
+bool Pipeline::RetryPipelineCreation(vk::Result result, u32 attempt, std::string_view kind,
+                                     std::string_view debug_str) {
+    // With the driver's cache cold, as after an update, the compiler threads build hundreds of
+    // pipelines at once while the game loads, and the driver failed one of them now and then with
+    // an unknown error, which ended the game. Building it again a little later can succeed.
+    constexpr u32 MaxAttempts = 5;
+    const bool may_recover = result == vk::Result::eErrorUnknown ||
+                             result == vk::Result::eErrorOutOfHostMemory ||
+                             result == vk::Result::eErrorOutOfDeviceMemory ||
+                             result == vk::Result::eErrorInitializationFailed;
+    if (!may_recover || attempt >= MaxAttempts) {
+        return false;
+    }
+    LOG_WARNING(Render_Vulkan, "Creating {} pipeline {} failed with {}, trying again", kind,
+                debug_str, vk::to_string(result));
+    std::this_thread::sleep_for(std::chrono::milliseconds{100} * attempt);
+    return true;
+}
+
+void Pipeline::BindResources(Scheduler& target, DescriptorWrites& set_writes,
                              const Shader::PushData& push_data) const {
-    const auto cmdbuf = scheduler.CommandBuffer();
+    const auto cmdbuf = target.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;
 
     const auto stage_flags = IsCompute() ? vk::ShaderStageFlagBits::eCompute : AllGraphicsStageBits;
-    scheduler.GetDynamicState().PushConstants(cmdbuf, *pipeline_layout, IsCompute(), stage_flags,
-                                              &push_data, sizeof(push_data));
+    target.GetDynamicState().PushConstants(cmdbuf, *pipeline_layout, IsCompute(), stage_flags,
+                                           &push_data, sizeof(push_data));
 
     // Bind descriptor set.
     if (set_writes.empty()) {
@@ -89,11 +109,8 @@ void Pipeline::BindResources(DescriptorWrites& set_writes,
     }
 
     const auto desc_set = desc_heap.Commit(*desc_layout);
-    for (auto& set_write : set_writes) {
-        set_write.dstSet = desc_set;
-    }
-    instance.GetDevice().updateDescriptorSets(set_writes, {});
-    cmdbuf.bindDescriptorSets(bind_point, *pipeline_layout, 0, desc_set, {});
+    cmdbuf.updateAndBindDescriptorSet(instance.GetDevice(), bind_point, *pipeline_layout, desc_set,
+                                      set_writes);
 }
 
 std::string Pipeline::GetDebugString() const {

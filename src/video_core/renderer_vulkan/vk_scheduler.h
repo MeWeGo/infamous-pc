@@ -67,17 +67,27 @@ struct RenderState {
 };
 static_assert(std::has_unique_object_representations_v<RenderState>);
 
+class Scheduler;
+
 struct SubmitInfo {
     std::array<vk::Semaphore, 4> wait_semas;
     std::array<u64, 4> wait_ticks;
+    std::array<vk::PipelineStageFlags, 4> wait_stages;
     std::array<vk::Semaphore, 4> signal_semas;
     std::array<u64, 4> signal_ticks;
     vk::Fence fence;
     u32 num_wait_semas;
     u32 num_signal_semas;
+    /// A tick of another scheduler the submit waits for, which is submitted to the driver first:
+    /// waiting on another queue for work not submitted yet held up the driver's pipeline builds
+    /// until the game hung.
+    Scheduler* submitted_first{};
+    u64 submitted_first_tick{};
 
-    void AddWait(vk::Semaphore semaphore, u64 tick = 1) {
+    void AddWait(vk::Semaphore semaphore, u64 tick = 1,
+                 vk::PipelineStageFlags stage = vk::PipelineStageFlagBits::eAllCommands) {
         wait_semas[num_wait_semas] = semaphore;
+        wait_stages[num_wait_semas] = stage;
         wait_ticks[num_wait_semas++] = tick;
     }
 
@@ -427,12 +437,16 @@ struct DynamicState {
 
 using SessionFunc = Common::UniqueFunction<void>;
 using SubmitFunc = Common::UniqueFunction<void, SubmitInfo&>;
+using HostWorkMarkFunc = Common::UniqueFunction<u64>;
+using HostWorkWaitFunc = Common::UniqueFunction<void, u64>;
 
 class Scheduler {
 public:
     /// With record_on_thread, the Vulkan commands are recorded and submitted on a thread of the
-    /// scheduler's own, from a stream of them the thread using the scheduler fills.
-    explicit Scheduler(const Instance& instance, bool record_on_thread = false);
+    /// scheduler's own, from a stream of them the thread using the scheduler fills. They go to the
+    /// graphics queue, or the queue given.
+    explicit Scheduler(const Instance& instance, bool record_on_thread = false,
+                       vk::Queue queue = {});
     ~Scheduler();
 
     /// Sends the current execution context to the GPU
@@ -478,6 +492,26 @@ public:
     /// Sets a function to be called on every scheduler submission.
     void SetSubmitCallback(SubmitFunc&& on_submit) {
         this->on_submit = std::move(on_submit);
+    }
+
+    /// Sets a function to be called on every submission before anything else, outside of the
+    /// submit lock, which may submit to other schedulers and add what to wait for.
+    void SetPreSubmitCallback(SubmitFunc&& on_pre_submit) {
+        this->on_pre_submit = std::move(on_pre_submit);
+    }
+
+    /// Counts the times commands were asked to be recorded, so a caller can tell whether any were
+    /// in between.
+    [[nodiscard]] u64 CommandsRequested() const noexcept {
+        return commands_requested;
+    }
+
+    /// Sets the work other threads do for command buffers before they can run, like copying
+    /// memory into their staging buffers: mark returns where it is up to as a command buffer is
+    /// flushed, and wait waits for that before the command buffer is submitted.
+    void SetHostWork(HostWorkMarkFunc&& mark, HostWorkWaitFunc&& wait) {
+        host_work_mark = std::move(mark);
+        host_work_wait = std::move(wait);
     }
 
     /// Returns the current render state.
@@ -527,6 +561,7 @@ public:
 
     /// Returns the current command buffer.
     CommandRecorder CommandBuffer() const {
+        ++commands_requested;
         if (stream) {
             return CommandRecorder{*stream, CommandTarget::Primary};
         }
@@ -603,7 +638,13 @@ public:
     /// Marks a dispatch, given the program it runs, its workgroups if known and whether draws
     /// came before it.
     void MarkDispatch(DispatchMark mark, u64 program_hash = 0, u32 groups = 0,
-                      bool after_draws = false, bool compute_ring = false);
+                      bool after_draws = false, bool compute_ring = false, bool is_draw = false,
+                      u64 vertex_hash = 0);
+
+    /// Whether the command buffer being recorded is one whose dispatches and draws are timed.
+    bool TimingDispatches() const {
+        return !sessions.empty() && sessions.back().time_dispatches;
+    }
 
     /// Defers an operation until the gpu has reached the current cpu tick.
     /// Runs as soon as possible in another thread.
@@ -619,6 +660,10 @@ public:
 
 private:
     static constexpr u32 RunMarksPerPair = 32;
+    /// One command buffer in this many has where its runs of draws and of dispatches begin
+    /// marked. Each mark waits for the work before it, and reading them back took time on the
+    /// GPU thread for every command buffer.
+    static constexpr u64 RunMarkInterval = 8;
     using RunMarks = boost::container::static_vector<bool, RunMarksPerPair>;
 
     void EndSession();
@@ -635,6 +680,9 @@ private:
             func(direct_context);
         }
     }
+
+    /// Waits for the work other threads do for a command buffer, see SetHostWork.
+    void WaitHostWork(u64 mark);
 
     /// Submits the command buffers ended since the last submission. Called where they are
     /// recorded, with the submit mutex held.
@@ -660,14 +708,27 @@ private:
     /// Counts the dispatches timed one by one in a command buffer that is done, and logs where
     /// their time went every few seconds.
     void CollectDispatchTimes();
+    void ReportDrawTimes();
 
 private:
     const Instance& instance;
+    /// The queue submitted to, and whether it is the graphics queue.
+    vk::Queue queue;
+    bool on_graphics_queue;
+    /// Taken to submit to the queue: submit_mutex for the graphics queue, which other threads
+    /// submit to too, and a mutex of its own for another queue. Presentation holds submit_mutex
+    /// while the GPU catches up, which may be waiting for what another queue has to submit.
+    std::mutex own_queue_mutex;
+    std::mutex& queue_mutex;
     Semaphore work_semaphore;
     CommandPool command_pool;
     DynamicState dynamic_state;
     SessionFunc on_session{};
     SubmitFunc on_submit{};
+    SubmitFunc on_pre_submit{};
+    mutable u64 commands_requested{};
+    HostWorkMarkFunc host_work_mark{};
+    HostWorkWaitFunc host_work_wait{};
     struct Session {
         /// Whether anything was recorded into the upload command buffer.
         bool has_upload{};
@@ -682,6 +743,8 @@ private:
         /// whether more began than could be marked.
         RunMarks run_marks;
         bool run_marks_overflow{};
+        /// Whether where runs of work begin is marked in it, which only a few are.
+        bool mark_runs{};
         /// Whether its dispatches are timed one by one.
         bool time_dispatches{};
     };
@@ -722,8 +785,8 @@ private:
 
     /// One command buffer in this many has its dispatches timed one by one. Their marks keep
     /// the GPU from overlapping them with other work, so few are.
-    static constexpr u64 TimedDispatchInterval = 64;
-    static constexpr u32 MaxTimedDispatches = 1024;
+    static constexpr u64 TimedDispatchInterval = 512;
+    static constexpr u32 MaxTimedDispatches = 4096;
     /// Three timestamps for each dispatch timed.
     vk::UniqueQueryPool dispatch_pool;
     struct TimedDispatch {
@@ -734,6 +797,10 @@ private:
         bool compute_ring;
         /// Which of its marks were written.
         u32 marks;
+        /// Whether it is a draw, run by its pixel shader (or its vertex shader if it has none,
+        /// as program_hash) and the vertex shader in vertex_hash, with its vertices as groups.
+        bool is_draw;
+        u64 vertex_hash;
     };
     /// The dispatches timed in the command buffer being recorded, and in the one submitted
     /// whose times aren't read yet, with its tick.
@@ -748,6 +815,16 @@ private:
     /// Since the last report: the time of the dispatches of each program, and of what came
     /// before dispatches after draws and after other dispatches.
     std::unordered_map<u64, DispatchTimes> dispatch_times;
+    struct DrawTimes {
+        u64 draw_ns;
+        u64 setup_ns;
+        u64 count;
+        u64 vertices;
+        u64 vertex_hash;
+    };
+    /// The same for draws, by pixel shader: the draws themselves and what came before them in
+    /// the command buffer, the render pass and barriers.
+    std::unordered_map<u64, DrawTimes> draw_times;
     std::array<DispatchTimes, 2> dispatch_times_by_kind{};
     std::array<u64, 2> before_dispatch_ns{};
     /// The same for the dispatches of the graphics ring and of the compute rings, barriers and

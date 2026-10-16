@@ -34,6 +34,10 @@ class TextureCache {
     static constexpr s64 DEFAULT_PRESSURE_GC_MEMORY = 1_GB + 512_MB;
     static constexpr s64 DEFAULT_CRITICAL_GC_MEMORY = 3_GB;
     static constexpr s64 TARGET_GC_THRESHOLD = 8_GB;
+    /// Cards with a budget up to this get an earlier collector, see the constructor.
+    static constexpr s64 SMALL_CARD_MEMORY = 6_GB;
+    /// Room the collector tries to leave for memory the buffer cache makes resident.
+    static constexpr s64 RESIDENCY_HEADROOM = 1_GB;
 
     struct BucketEntry {
         u32 key;
@@ -127,14 +131,26 @@ public:
     template <typename MakeDesc>
     [[nodiscard]] ImageId FindImageCached(std::span<const u32> key, ImageDesc& desc,
                                           MakeDesc&& make_desc) {
-        auto& lookup = binding_lookups[HashBindingKey(key) % binding_lookups.size()];
-        if (UseBindingLookup(lookup, key, desc)) {
-            return lookup.image_id;
-        }
-        make_desc(desc);
-        const ImageId image_id = FindImage(desc);
-        RememberBindingLookup(lookup, key, desc, image_id);
+        const auto [image_id, found_desc] =
+            FindImageCachedRef(key, std::forward<MakeDesc>(make_desc));
+        desc = *found_desc;
         return image_id;
+    }
+
+    /// As FindImageCached, but the descriptor is left where the lookup keeps it, and only valid
+    /// until the next lookup. Callers that only need a part of it, like the view of a texture,
+    /// don't have to copy all of it, which was a good part of binding each texture.
+    template <typename MakeDesc>
+    [[nodiscard]] std::pair<ImageId, const ImageDesc*> FindImageCachedRef(std::span<const u32> key,
+                                                                          MakeDesc&& make_desc) {
+        auto& lookup = binding_lookups[HashBindingKey(key) % binding_lookups.size()];
+        if (!UseBindingLookup(lookup, key)) {
+            ImageDesc desc;
+            make_desc(desc);
+            const ImageId image_id = FindImage(desc);
+            RememberBindingLookup(lookup, key, desc, image_id);
+        }
+        return {lookup.image_id, &lookup.desc};
     }
 
     /// Changes whenever an image is added or removed, which is all that can change what
@@ -148,6 +164,10 @@ public:
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] ImageView& FindTexture(ImageId image_id, const ImageDesc& desc);
+
+    /// As above, for a descriptor of the type and with the view given.
+    [[nodiscard]] ImageView& FindTexture(ImageId image_id, BindingType type,
+                                         const ImageViewInfo& view_info);
 
     /// Retrieves the render target with specified properties
     [[nodiscard]] ImageView& FindRenderTarget(ImageId image_id, const ImageDesc& desc);
@@ -270,6 +290,11 @@ public:
 
     /// Runs the garbage collector.
     void RunGarbageCollector();
+
+    /// Frees the images that have not been used for a while, without the collector's limits on how
+    /// many go, for an allocation that failed for lack of device memory. GPU thread. Returns
+    /// whether any image was freed. The memory is released once the GPU is done with the images.
+    bool ReleaseMemoryForAllocation();
 
     /// Calls func for every image starting at the address that ForEachImageInRegion would report
     /// for the region, in the same order. Such images are all listed in the page the address is
@@ -402,9 +427,8 @@ private:
 
     static u64 HashBindingKey(std::span<const u32> key);
 
-    /// Fills in the descriptor from the lookup and returns true if it is for the key and still
-    /// valid.
-    bool UseBindingLookup(BindingLookup& lookup, std::span<const u32> key, ImageDesc& desc);
+    /// Returns true if the lookup is for the key and still valid, marking its image as used.
+    bool UseBindingLookup(BindingLookup& lookup, std::span<const u32> key);
 
     void RememberBindingLookup(BindingLookup& lookup, std::span<const u32> key,
                                const ImageDesc& desc, ImageId image_id);

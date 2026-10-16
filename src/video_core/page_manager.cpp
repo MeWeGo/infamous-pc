@@ -15,6 +15,7 @@
 #include "common/perf_profiler.h"
 #include "common/signal_context.h"
 #include "common/thread.h"
+#include "common/tuning.h"
 #include "core/emulator_settings.h"
 #include "core/memory.h"
 #include "core/signals.h"
@@ -229,12 +230,19 @@ struct PageManager::Impl {
 
         const auto release_pending = [&] {
             if (range_pages > 0) {
+                bool deferred = false;
                 if (t_deferred_protect) {
                     // The upload worker applies the protection before it copies the pages,
                     // so a guest write in between is caught by its snapshot, and one after
                     // faults and re-dirties the page.
                     t_deferred_protect->emplace_back(range_begin, range_begin + range_pages);
-                } else {
+                    deferred = true;
+                }
+                if (deferred_protection) {
+                    deferred_protection->emplace_back(range_begin, range_pages);
+                    deferred = true;
+                }
+                if (!deferred) {
                     Protect(range_begin << PM_PAGE_BITS, range_pages << PM_PAGE_BITS, perms);
                 }
                 range_pages = 0;
@@ -327,6 +335,46 @@ struct PageManager::Impl {
         UnlockGroups(locked);
         return covered_pages;
     }
+
+    void ApplyProtection(u64 first_page, u64 num_pages) {
+        Core::MemoryPermission perms{};
+        u64 run_begin = first_page;
+        u64 run_pages = 0;
+        const auto release_run = [&] {
+            if (run_pages > 0) {
+                Protect(run_begin << PM_PAGE_BITS, run_pages << PM_PAGE_BITS, perms);
+                run_pages = 0;
+            }
+        };
+        // Under the locks of the pages, so the state read is what any change made since applied
+        // too, and any change made after it is applied after this.
+        LockedGroups locked;
+        for (u64 page = first_page; page != first_page + num_pages; ++page) {
+            const PageState* state = cached_pages.find(page);
+            if (!state) {
+                release_run();
+                continue;
+            }
+            LockGroup(page, locked);
+            const auto page_perms = state->Perms();
+            if (run_pages != 0 && page_perms != perms) {
+                release_run();
+            }
+            if (run_pages == 0) {
+                run_begin = page;
+                perms = page_perms;
+            }
+            ++run_pages;
+        }
+        release_run();
+        UnlockGroups(locked);
+    }
+
+    /// Where the calling thread adds pages whose protection it changes for regions instead of
+    /// applying it, if anywhere.
+    inline static thread_local PendingProtection* deferred_protection = nullptr;
+    /// Whether the calling thread applies protection others deferred.
+    inline static thread_local bool applies_deferred_protection = false;
 
     struct PageTraits {
         using Entry = PageState;
@@ -497,6 +545,13 @@ struct SignalImpl : public PageManager::Impl {
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
         RENDERER_TRACE;
+        if (applies_deferred_protection) {
+            // Counted with the rest of that thread's work.
+            ASSERT_MSG(perms != Core::MemoryPermission::Write,
+                       "Attempted to protect region as write-only which is not a valid permission");
+            Core::Memory::Instance()->GetAddressSpace().Protect(address, size, perms);
+            return;
+        }
         Common::Perf::ScopedStall stall{std::this_thread::get_id() ==
                                                 rasterizer->GetGpuCommandProcessorThread()
                                             ? Common::Perf::Stall::PageProtectGpu
@@ -563,8 +618,12 @@ struct SignalImpl : public PageManager::Impl {
     /// the one it faulted on, more of them the longer it keeps going, so it faults once a block.
     /// Pages it stops short of are only uploaded again, which costs less than the faults saved.
     static void InvalidateAhead(VAddr addr) {
-        static constexpr u32 MinRun = 2;
-        static constexpr u64 MaxPagesAhead = 64;
+        static const u32 MinRun = static_cast<u32>(Common::Tune("SHAD_AHEAD_MINRUN", 2));
+        static const u64 MaxPagesAhead = Common::Tune("SHAD_AHEAD_MAX", 16);
+        static const u64 FirstPagesAhead = Common::Tune("SHAD_AHEAD_BASE", 4);
+        if (MaxPagesAhead == 0) {
+            return;
+        }
         thread_local u64 last_page = 0;
         thread_local u32 run = 0;
         const u64 page = addr >> PageManager::PM_PAGE_BITS;
@@ -574,7 +633,7 @@ struct SignalImpl : public PageManager::Impl {
             return;
         }
         const u64 pages_ahead =
-            std::min<u64>(u64{4} << std::min<u32>(run - MinRun, 4), MaxPagesAhead);
+            std::min<u64>(FirstPagesAhead << std::min<u32>(run - MinRun, 2), MaxPagesAhead);
         rasterizer->InvalidateBuffersAhead((page + 1) << PageManager::PM_PAGE_BITS,
                                            pages_ahead << PageManager::PM_PAGE_BITS);
         // The next fault of the thread going on is on the page after them.
@@ -606,6 +665,18 @@ void PageManager::OnGpuMap(VAddr address, size_t size) {
 
 void PageManager::OnGpuUnmap(VAddr address, size_t size) {
     impl->OnUnmap(address, size);
+}
+
+void PageManager::DeferProtection(PendingProtection* pending) {
+    Impl::deferred_protection = pending;
+}
+
+void PageManager::ApplyProtection(u64 first_page, u64 num_pages) const {
+    impl->ApplyProtection(first_page, num_pages);
+}
+
+void PageManager::AppliesDeferredProtection() {
+    Impl::applies_deferred_protection = true;
 }
 
 void PageManager::UpdatePageWatchers(VAddr addr, u64 size, PageOp write_op) const {

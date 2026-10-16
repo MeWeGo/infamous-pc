@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 
 #include "common/types.h"
@@ -33,6 +34,8 @@ enum class Stall : u32 {
     Present,          ///< Presenting a frame to the swapchain.
     FrameWait,        ///< Waiting for a presentation frame to be free to draw the next one into.
     CommandRecording, ///< Recording the GPU thread's commands into Vulkan on a thread of its own.
+    UploadThread,     ///< Protecting and copying memory for uploads on a thread of their own.
+    UploadWait,       ///< Submitting a command buffer waiting for that to be done for it.
     Count,
 };
 
@@ -62,14 +65,34 @@ enum class Counter : u32 {
     SwitchBarriers,          ///< Barriers right before such a switch.
     SharedMemoryDispatches,  ///< Dispatches whose shared memory is kept in a buffer.
     SharedMemoryBytes,       ///< Bytes of such buffers cleared for them.
+    ComputeRingDispatches,   ///< Dispatches of the game's compute rings.
+    AsyncDispatches,         ///< Those run on the second queue.
+    AsyncUploads,            ///< Buffer uploads run on the second queue.
+    AsyncReadbacks,          ///< Copies back of memory made on the second queue.
+    AsyncGraphicsSubmits,    ///< Graphics submits for compute ring work depending on it.
     Count,
 };
 
 /// Adds time spent in a category, plus an optional amount of data it handled.
 void Record(Stall stall, u64 nanoseconds, u64 bytes = 0);
 
-/// Counts events of a kind.
-void Count(Counter counter, u64 amount = 1);
+namespace Detail {
+/// Counts of the calling thread's events, set up the first time it counts one.
+std::atomic<u64>* LocalEvents();
+inline thread_local std::atomic<u64>* local_events = nullptr;
+} // namespace Detail
+
+/// Counts events of a kind. The GPU thread counts a dozen for every draw, and calling out to count
+/// each took over 1% of its time, so it is done in place.
+inline void Count(Counter counter, u64 amount = 1) {
+    std::atomic<u64>* events = Detail::local_events;
+    if (!events) [[unlikely]] {
+        events = Detail::local_events = Detail::LocalEvents();
+    }
+    // Only the calling thread writes its counts, see LocalCounters.
+    auto& value = events[static_cast<size_t>(counter)];
+    value.store(value.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
 
 /// Events of a kind the calling thread counted since it started, for telling apart what it
 /// counted between two points.

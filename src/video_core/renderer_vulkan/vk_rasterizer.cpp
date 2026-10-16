@@ -116,9 +116,45 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         const u64 tick = compute_queue.CurrentTick();
         return {compute_queue.GetSemaphore().Handle(), tick > 0 ? tick - 1 : 0};
     });
+
+    if (const auto async_queue = instance.GetAsyncQueue()) {
+        async_scheduler =
+            std::make_unique<Scheduler>(instance, scheduler.RecordsOnThread(), async_queue);
+        runtime.SetAsyncScheduler(async_scheduler.get());
+        buffer_cache.SetHostWorkOn(*async_scheduler);
+        // What the graphics queue runs next was recorded after all work submitted to the second
+        // queue so far, and may read what that wrote. Waiting for it also keeps what that work
+        // uses alive as long as the graphics tick it was recorded in.
+        scheduler.SetPreSubmitCallback([this](Vulkan::SubmitInfo& info) {
+            runtime.OnGraphicsSubmit(scheduler.CurrentTick());
+            const u64 tick = runtime.FlushAsync();
+            if (tick > async_tick_waited) {
+                info.AddWait(async_scheduler->GetWorkSemaphore()->Handle(), tick);
+                info.submitted_first = async_scheduler.get();
+                info.submitted_first_tick = tick;
+                async_tick_waited = tick;
+            }
+        });
+        // Work on the second queue waits for the graphics work submitted it depends on.
+        async_scheduler->SetPreSubmitCallback([this](Vulkan::SubmitInfo& info) {
+            const u64 tick = runtime.AsyncGraphicsWait();
+            if (tick > graphics_tick_waited) {
+                info.AddWait(scheduler.GetWorkSemaphore()->Handle(), tick);
+                info.submitted_first = &scheduler;
+                info.submitted_first_tick = tick;
+                graphics_tick_waited = tick;
+            }
+        });
+    }
 }
 
-Rasterizer::~Rasterizer() = default;
+Rasterizer::~Rasterizer() {
+    if (async_scheduler) {
+        runtime.FlushAsync();
+        async_scheduler->Finish();
+        runtime.SetAsyncScheduler(nullptr);
+    }
+}
 
 bool Rasterizer::FilterDraw() {
     const auto& regs = liverpool->regs;
@@ -307,6 +343,16 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     scheduler.SubmitIfWorkPiledUp(state);
     scheduler.CountWork();
 
+    if (scheduler.TimingDispatches()) {
+        // The draw is named by its pixel shader, or by its vertex shader if it has none.
+        const auto* vertex_info = pipeline->GetStages()[u32(Shader::SwStage::Vertex)];
+        const auto* pixel_info = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
+        const u64 vertex_hash = vertex_info ? vertex_info->pgm_hash : 0;
+        scheduler.MarkDispatch(
+            Scheduler::DispatchMark::Begin, pixel_info ? pixel_info->pgm_hash : vertex_hash,
+            regs.num_indices * regs.num_instances.NumInstances(), false, false, true, vertex_hash);
+    }
+
     BindVertexBuffers(pipeline);
     if (is_indexed) {
         BindIndexBuffer(index_offset);
@@ -337,6 +383,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     scheduler.GetDynamicState().BindGraphicsPipeline(cmdbuf, pipeline->Handle());
 
+    scheduler.MarkDispatch(Scheduler::DispatchMark::Start);
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), 0,
                            s32(vertex_offset), instance_offset);
@@ -344,6 +391,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    scheduler.MarkDispatch(Scheduler::DispatchMark::End);
     DebugState.IncDrawCall();
     Common::Perf::Count(Common::Perf::Counter::Draws);
     if (std::exchange(last_work_compute, false)) {
@@ -727,12 +775,28 @@ void Rasterizer::DispatchDirect() {
         return;
     }
 
+    // Ours: batched compute-queue route (buffers-only, push descriptors, compute rings).
     if (IsAsyncComputeEligible(*pipeline, cs)) {
         RouteComputeDispatch(pipeline);
         return;
     }
 
-    if (!BindResources(pipeline)) {
+    // Theirs: the game's compute rings run on the second queue, after the graphics work
+    // they depend on. Whether a dispatch can is known once it is bound.
+    const bool compute_ring = liverpool->IsComputeRingActive();
+    const bool try_async = async_scheduler && compute_ring && CanBindOnAsync(*pipeline);
+    const u64 commands_before = scheduler.CommandsRequested();
+    runtime.SetRecordingForAsync(try_async);
+    const bool bound = BindResources(pipeline);
+    runtime.SetRecordingForAsync(false);
+    if (!bound) {
+        return;
+    }
+    if (compute_ring) {
+        Common::Perf::Count(Common::Perf::Counter::ComputeRingDispatches);
+    }
+    if (try_async && OrderOnAsync(commands_before)) {
+        DispatchOnAsync(*pipeline, cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
         return;
     }
 
@@ -768,6 +832,58 @@ void Rasterizer::DispatchDirect() {
     scheduler.CountWork();
 
     ResetBindings(true);
+
+    if (try_async) {
+        // It depends on graphics work not submitted yet, and the compute ring's work after it
+        // likely depends on it: submitted, they can wait for it on the second queue.
+        scheduler.Flush();
+        Common::Perf::Count(Common::Perf::Counter::AsyncGraphicsSubmits);
+    }
+}
+
+bool Rasterizer::CanBindOnAsync(const ComputePipeline& pipeline) const {
+    // Images are laid out and transitioned for the graphics queue, and memory read through
+    // addresses isn't known. A pipeline still being built would hold up the queue.
+    const auto& cs = pipeline.GetStage(Shader::SwStage::Compute);
+    return cs.images.empty() && !cs.uses_dma && pipeline.IsReady();
+}
+
+bool Rasterizer::OrderOnAsync(u64 commands_before) {
+    if (scheduler.CommandsRequested() != commands_before || untracked_access) {
+        return false;
+    }
+    const auto* stream_buffer = &buffer_cache.GetStreamBuffer();
+    u64 dependency = 0;
+    for (const auto& [buffer, offset, size, is_written] : bound_buffers) {
+        // Stream buffer memory is only written again once the graphics queue is done with the
+        // tick it was written in, which waits for what the second queue was given meanwhile.
+        if (buffer == stream_buffer) {
+            continue;
+        }
+        dependency =
+            std::max(dependency, runtime.GraphicsDependency(buffer, offset, size, !is_written));
+    }
+    if (dependency >= scheduler.CurrentTick()) {
+        return false;
+    }
+    runtime.WaitOnGraphics(dependency);
+    return true;
+}
+
+void Rasterizer::DispatchOnAsync(const ComputePipeline& pipeline, u32 dim_x, u32 dim_y, u32 dim_z) {
+    const auto cmdbuf = runtime.AsyncCommandBuffer();
+    pipeline.BindResources(*async_scheduler, set_writes, push_data);
+    async_scheduler->GetDynamicState().BindComputePipeline(cmdbuf, pipeline.Handle());
+    cmdbuf.dispatch(dim_x, dim_y, dim_z);
+    async_scheduler->CountWork();
+    DebugState.IncDispatch();
+    Common::Perf::Count(Common::Perf::Counter::Dispatches);
+    Common::Perf::Count(Common::Perf::Counter::AsyncDispatches);
+    // The graphics queue waits for the second one before it runs what is recorded next, so the
+    // accesses aren't kept for its barriers.
+    bound_images.clear();
+    bound_buffers.clear();
+    needs_barrier = false;
 }
 
 void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
@@ -847,6 +963,10 @@ void Rasterizer::OnSubmit() {
 void Rasterizer::OnFence() {
     texture_cache.ProcessDownloadImages();
     buffer_cache.PrefetchReadbacks();
+    if (async_scheduler && liverpool->IsComputeRingActive()) {
+        // The game is told the compute ring's work is done, and reads what it wrote next.
+        runtime.FlushAsync();
+    }
 }
 
 bool Rasterizer::BindResources(const Pipeline* pipeline) {
@@ -954,9 +1074,12 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
     // buffers after the draw, so an upload over them waits for it.
     for (auto& range : ranges_merged) {
         const u64 size = memory->ClampRangeSize(range.base_address, range.GetSize());
+        bool unwritten = false;
         std::tie(range.buffer, range.offset) =
-            buffer_cache.ObtainBuffer(range.base_address, size, false, false, true);
-        needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+            buffer_cache.ObtainBuffer(range.base_address, size, false, false, true, &unwritten);
+        if (!unwritten) {
+            needs_barrier |= runtime.IsBufferAccessed(range.buffer, range.offset, size);
+        }
         bound_buffers.emplace_back(range.buffer, range.offset, static_cast<u32>(size), false);
     }
 
@@ -1006,9 +1129,12 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
 
     // Bind index buffer.
     const u32 index_buffer_size = regs.num_indices * index_size;
+    bool unwritten = false;
     const auto [buffer, offset] =
-        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, true);
-    needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+        buffer_cache.ObtainBuffer(index_address, index_buffer_size, false, false, true, &unwritten);
+    if (!unwritten) {
+        needs_barrier |= runtime.IsBufferAccessed(buffer, offset, index_buffer_size);
+    }
     if (index_buffer_size != 0) {
         bound_buffers.emplace_back(buffer, offset, index_buffer_size, false);
     }
@@ -1261,8 +1387,10 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                               vsharp.GetSize(), size, stage.pgm_hash);
                 }
                 // Accesses are reported to the runtime with the bound buffers after the draw.
-                const auto [buffer, offset] = buffer_cache.ObtainBuffer(
-                    vsharp.base_address, size, desc.is_written, desc.is_formatted, true);
+                bool unwritten = false;
+                const auto [buffer, offset] =
+                    buffer_cache.ObtainBuffer(vsharp.base_address, size, desc.is_written,
+                                              desc.is_formatted, true, &unwritten);
                 const u64 offset_aligned = Common::AlignDown(offset, alignment);
                 const u64 adjust = offset - offset_aligned;
                 if (adjust % 4 != 0) {
@@ -1279,7 +1407,12 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                         buffer_cache.NoteComputeRingWrite(vsharp.base_address, size);
                     }
                 }
-                needs_barrier |= runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                // Most are small buffers read, which the buffer cache checked already. Checking
+                // them twice was most of the 100000 checks a frame in inFAMOUS Second Son.
+                if (!unwritten) {
+                    needs_barrier |=
+                        runtime.IsBufferAccessed(buffer, offset, size, desc.is_written);
+                }
             }
         }
 
@@ -1294,18 +1427,39 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
     }
 }
 
+/// The descriptor a texture binding is found with, for the given one of the bindings made for
+/// each mip level, if the shader stores to explicit ones.
+static void MakeTextureDesc(VideoCore::TextureCache::ImageDesc& desc, const AmdGpu::Image& tsharp,
+                            const Shader::ImageResource& image_desc, u32 binding_index) {
+    std::construct_at(&desc, tsharp, image_desc);
+    if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
+        desc.view_info.range.base.level += image_desc.constant_mip_index;
+        desc.view_info.range.extent.levels = 1;
+    } else if (image_desc.mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
+        desc.view_info.range.base.level += binding_index;
+        desc.view_info.range.extent.levels = 1;
+    }
+}
+
 void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindings& binding) {
     const u32 first_image_idx = image_infos.size();
     // To emulate storing to explicit mip levels, build a descriptor array with each mip level.
-    boost::container::small_vector<u32, 8> image_descriptor_array_sizes;
+    // Room for as many as there can be, as programs with more than a few had them allocated on
+    // every draw.
+    boost::container::static_vector<u32, Shader::NUM_IMAGES> image_descriptor_array_sizes;
 
     u32 num_images{};
     for (const auto& image_desc : stage.images) {
         const auto tsharp = image_desc.GetSharp(stage);
         const auto data_fmt = tsharp.GetDataFmt();
         const auto num_fmt = tsharp.GetNumberFmt();
+        const auto unbound_type = image_desc.is_written
+                                      ? VideoCore::TextureCache::BindingType::Storage
+                                      : VideoCore::TextureCache::BindingType::Texture;
         if (tsharp.Address() == 0 || data_fmt == AmdGpu::DataFormat::FormatInvalid) {
-            image_bindings[num_images++].image_id = {};
+            auto& unbound = image_bindings[num_images++];
+            unbound.image_id = {};
+            unbound.type = unbound_type;
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
@@ -1317,16 +1471,22 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
                         "data_format={}, num_format={}",
                         tsharp.Address(), tsharp.pitch, tsharp.width, static_cast<u32>(data_fmt),
                         static_cast<u32>(num_fmt));
-            image_bindings[num_images++].image_id = {};
+            auto& unbound = image_bindings[num_images++];
+            unbound.image_id = {};
+            unbound.type = unbound_type;
             image_descriptor_array_sizes.push_back(1);
             continue;
         }
 
         const Shader::MipStorageFallbackMode mip_fallback_mode = image_desc.mip_fallback_mode;
+        // Ours: reuse the already-fetched sharp instead of fetching it twice per image per
+        // draw; theirs: invariant check for constant-mip mode.
         const u32 num_bindings = image_desc.NumBindings(tsharp);
+        ASSERT(mip_fallback_mode != Shader::MipStorageFallbackMode::ConstantIndex ||
+               num_bindings == 1);
 
         for (auto i = 0; i < num_bindings; i++) {
-            auto& [image_id, desc] = image_bindings[num_images++];
+            auto& image_binding = image_bindings[num_images++];
             // Everything the descriptor is built from.
             const u32 flags = u32{image_desc.is_written} | u32{image_desc.is_depth} << 1 |
                               u32{image_desc.is_array} << 2 |
@@ -1337,17 +1497,15 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
             const auto key = MakeKey(VideoCore::TextureCache::BindingType::Texture, flags,
                                      std::bit_cast<std::array<u32, sizeof(tsharp) / 4>>(tsharp),
                                      std::array<u32, 1>{level});
-            image_id = texture_cache.FindImageCached(key, desc, [&](auto& new_desc) {
-                std::construct_at(&new_desc, tsharp, image_desc);
-                if (mip_fallback_mode == Shader::MipStorageFallbackMode::ConstantIndex) {
-                    ASSERT(num_bindings == 1);
-                    new_desc.view_info.range.base.level += image_desc.constant_mip_index;
-                    new_desc.view_info.range.extent.levels = 1;
-                } else if (mip_fallback_mode == Shader::MipStorageFallbackMode::DynamicIndex) {
-                    new_desc.view_info.range.base.level += i;
-                    new_desc.view_info.range.extent.levels = 1;
-                }
-            });
+            const auto [found_id, found_desc] = texture_cache.FindImageCachedRef(
+                key, [&](auto& new_desc) { MakeTextureDesc(new_desc, tsharp, image_desc, i); });
+            image_binding.image_id = found_id;
+            image_binding.view_info = found_desc->view_info;
+            image_binding.type = found_desc->type;
+            image_binding.tsharp = tsharp;
+            image_binding.resource = &image_desc;
+            image_binding.level = static_cast<u32>(i);
+            auto& image_id = image_binding.image_id;
             auto* image = &texture_cache.GetImage(image_id);
             if (auto depth_image_id = texture_cache.GetAssociatedDepth(*image)) {
                 // If this image has an associated depth image, it's a stencil attachment.
@@ -1368,21 +1526,30 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
 
     // Second pass to re-bind images that were updated after binding
     for (u32 i = 0; i < num_images; ++i) {
-        auto& [image_id, desc] = image_bindings[i];
-        bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        auto& image_binding = image_bindings[i];
+        auto& image_id = image_binding.image_id;
+        bool is_storage = image_binding.type == VideoCore::TextureCache::BindingType::Storage;
         if (!image_id) {
             image_infos.emplace_back(VK_NULL_HANDLE, VK_NULL_HANDLE, vk::ImageLayout::eGeneral);
         } else {
             if (auto& old_image = texture_cache.GetImage(image_id);
                 old_image.binding.needs_rebind) {
                 old_image.binding = {};
+                VideoCore::TextureCache::ImageDesc desc;
+                MakeTextureDesc(desc, image_binding.tsharp, *image_binding.resource,
+                                image_binding.level);
                 image_id = texture_cache.FindImage(desc);
+                image_binding.view_info = desc.view_info;
+                image_binding.type = desc.type;
+                is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
             }
 
             bound_images.emplace_back(image_id);
 
             auto& image = texture_cache.GetImage(image_id);
-            auto& image_view = texture_cache.FindTexture(image_id, desc);
+            auto& image_view =
+                texture_cache.FindTexture(image_id, image_binding.type, image_binding.view_info);
+            const auto& desc = image_binding;
             const auto binding = image.binding;
 
             // The image is either bound as storage in a separate descriptor or bound as render
@@ -1425,8 +1592,8 @@ void Rasterizer::BindTextures(const Shader::Info& stage, Shader::Backend::Bindin
     u32 image_info_idx = first_image_idx;
     u32 image_binding_idx = 0;
     for (u32 array_size : image_descriptor_array_sizes) {
-        const auto& [_, desc] = image_bindings[image_binding_idx];
-        const bool is_storage = desc.type == VideoCore::TextureCache::BindingType::Storage;
+        const bool is_storage =
+            image_bindings[image_binding_idx].type == VideoCore::TextureCache::BindingType::Storage;
         auto& set_write = set_writes[set_write_index++];
         set_write.dstSet = VK_NULL_HANDLE;
         set_write.dstBinding = binding.unified;

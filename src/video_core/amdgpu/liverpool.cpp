@@ -34,6 +34,10 @@ static_assert(Liverpool::NumComputeRings <= MAX_NAMES);
 
 static const char* acb_task_name[] = NAME_ARRAY(ACB_TASK, MAX_NAMES);
 
+/// Dwords ahead of the packet being processed to bring into the cache. Prefetching never faults,
+/// so going past the end of the commands is harmless.
+static constexpr size_t PrefetchDistance = 64;
+
 #define YIELD(name)                                                                                \
     FIBER_EXIT;                                                                                    \
     co_yield {};                                                                                   \
@@ -230,6 +234,7 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
 
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
     FIBER_ENTER(dcb_task_name);
+    ++sync_count;
 
     cblock.Reset();
 
@@ -246,6 +251,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
     const auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (!dcb.empty()) {
         ProcessCommands();
+        // The game just wrote the commands, on another core, and the work for each draw pushes
+        // them out of the caches before the next is read: waiting for them was 1% of this
+        // thread. The ones a few packets on are asked for while this one is worked on.
+        __builtin_prefetch(dcb.data() + PrefetchDistance);
 
         const auto* header = reinterpret_cast<const PM4Header*>(dcb.data());
         const u32 type = header->type;
@@ -407,10 +416,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     ASSERT(set_size <= sizeof(ComputeProgram));
                     auto* addr = reinterpret_cast<u32*>(&mapped_queues[GfxQueueId].cs_state) +
                                  (set_data->reg_offset - 0x200);
-                    std::memcpy(addr, header + 2, set_size);
+                    CopyRegs(addr, reinterpret_cast<const u32*>(header + 2), count - 1);
                 } else {
-                    std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                                header + 2, set_size);
+                    CopyRegs(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
+                             reinterpret_cast<const u32*>(header + 2), count - 1);
                 }
                 break;
             }
@@ -769,9 +778,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (mem_semaphore->IsSignaling()) {
                     mem_semaphore->Signal();
                 } else {
+                    ++sync_count;
                     while (!mem_semaphore->Signaled()) {
                         YIELD_GFX();
                     }
+                    ++sync_count;
                     mem_semaphore->Decrement();
                 }
                 break;
@@ -785,12 +796,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     break;
                 }
                 const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+                ++sync_count;
                 while (!rewind->Valid()) {
                     YIELD_GFX();
                 }
+                ++sync_count;
                 break;
             }
             case PM4ItOpcode::WaitRegMem: {
+                ++sync_count;
                 const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
                 // ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
                 if (wait_reg_mem->Test(regs.reg_array)) {
@@ -808,11 +822,13 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (vo_port->IsVoLabel(wait_addr) &&
                     num_submits == mapped_queues[GfxQueueId].submits.size()) {
                     vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
+                    ++sync_count;
                     break;
                 }
                 while (!wait_reg_mem->Test(regs.reg_array)) {
                     YIELD_GFX();
                 }
+                ++sync_count;
                 break;
             }
             case PM4ItOpcode::IndirectBuffer: {
@@ -890,6 +906,7 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    ++sync_count;
     auto& queue = asc_queues[{vqid}];
 
     struct IndirectPatch {
@@ -902,6 +919,7 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     size_t acb_size = acb.size_bytes();
     while (!acb.empty()) {
         ProcessCommands();
+        __builtin_prefetch(acb.data() + PrefetchDistance);
 
         auto* header = reinterpret_cast<const PM4Header*>(acb.data());
         u32 next_dw_off = header->type3.NumWords() + 1;
@@ -1017,9 +1035,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            ++sync_count;
             while (!rewind->Valid()) {
                 YIELD_ASC(vqid);
             }
+            ++sync_count;
             break;
         }
         case PM4ItOpcode::SetShReg: {
@@ -1031,10 +1051,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
                 ASSERT(set_size <= sizeof(ComputeProgram));
                 auto* addr = reinterpret_cast<u32*>(&mapped_queues[vqid + 1].cs_state) +
                              (set_data->reg_offset - 0x200);
-                std::memcpy(addr, header + 2, set_size);
+                CopyRegs(addr, reinterpret_cast<const u32*>(header + 2),
+                         header->type3.NumWords() - 1);
             } else {
-                std::memcpy(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
-                            header + 2, set_size);
+                CopyRegs(&regs.reg_array[Regs::ShRegWordOffset + set_data->reg_offset],
+                         reinterpret_cast<const u32*>(header + 2), header->type3.NumWords() - 1);
             }
             break;
         }
@@ -1108,19 +1129,23 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                ++sync_count;
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
+                ++sync_count;
                 mem_semaphore->Decrement();
             }
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
+            ++sync_count;
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
+            ++sync_count;
             break;
         }
         case PM4ItOpcode::ReleaseMem: {

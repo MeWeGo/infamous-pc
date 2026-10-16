@@ -34,8 +34,11 @@ Scheduler::CostCounts CountCosts() {
 
 std::mutex Scheduler::submit_mutex;
 
-Scheduler::Scheduler(const Instance& instance, bool record_on_thread)
-    : instance{instance}, work_semaphore{instance}, command_pool{instance, &work_semaphore} {
+Scheduler::Scheduler(const Instance& instance, bool record_on_thread, vk::Queue queue_)
+    : instance{instance}, queue{queue_ ? queue_ : instance.GetGraphicsQueue()},
+      on_graphics_queue{queue == instance.GetGraphicsQueue()},
+      queue_mutex{on_graphics_queue ? submit_mutex : own_queue_mutex}, work_semaphore{instance},
+      command_pool{instance, &work_semaphore} {
 #if TRACY_GPU_ENABLED
     profiler_scope = reinterpret_cast<tracy::VkCtxScope*>(std::malloc(sizeof(tracy::VkCtxScope)));
 #endif
@@ -166,6 +169,15 @@ void Scheduler::CollectDispatchTimes() {
                     continue;
                 }
                 const u64 dispatch_ns = to_ns(*end - *start);
+                if (dispatch.is_draw) {
+                    auto& by_pixel_shader = draw_times[dispatch.program_hash];
+                    by_pixel_shader.draw_ns += dispatch_ns;
+                    by_pixel_shader.setup_ns += to_ns(*start - *begin);
+                    ++by_pixel_shader.count;
+                    by_pixel_shader.vertices += dispatch.groups;
+                    by_pixel_shader.vertex_hash = dispatch.vertex_hash;
+                    continue;
+                }
                 const size_t kind = dispatch.after_draws ? 1 : 0;
                 before_dispatch_ns[kind] += to_ns(*start - *begin);
                 auto& by_ring = dispatch_times_by_ring[dispatch.compute_ring ? 1 : 0];
@@ -243,11 +255,55 @@ void Scheduler::CollectDispatchTimes() {
              compute_rings.count, per_dispatch_us(compute_rings.dispatch_ns, compute_rings.count),
              graphics_ring.count, per_dispatch_us(graphics_ring.dispatch_ns, graphics_ring.count),
              static_cast<double>(total_ns) / 1'000'000.0, programs.size(), top);
+    ReportDrawTimes();
     dispatch_times.clear();
     dispatch_times_by_kind = {};
     dispatch_times_by_ring = {};
     before_dispatch_ns = {};
     timed_command_buffers = 0;
+}
+
+void Scheduler::ReportDrawTimes() {
+    // Draws are timed one by one like dispatches, so each waits for all work before it and its
+    // time is its own, a little more than it costs overlapped with other work. Which pixel
+    // shaders take the most is what this is for.
+    std::vector<std::pair<u64, DrawTimes>> programs(draw_times.begin(), draw_times.end());
+    draw_times.clear();
+    if (programs.empty()) {
+        return;
+    }
+    const size_t num_top = std::min<size_t>(10, programs.size());
+    std::partial_sort(
+        programs.begin(), programs.begin() + num_top, programs.end(),
+        [](const auto& a, const auto& b) { return a.second.draw_ns > b.second.draw_ns; });
+    u64 total_ns{};
+    u64 total_count{};
+    u64 setup_ns{};
+    for (const auto& [hash, times] : programs) {
+        total_ns += times.draw_ns;
+        total_count += times.count;
+        setup_ns += times.setup_ns;
+    }
+    std::string top;
+    for (size_t i = 0; i < num_top; ++i) {
+        const auto& [hash, times] = programs[i];
+        const double count = static_cast<double>(std::max<u64>(times.count, 1));
+        top += fmt::format("{}ps_{:#018x}+vs_{:#018x} {:.0f}% ({} of {:.1f} us, {:.0f} vertices)",
+                           i == 0 ? "" : ", ", hash, times.vertex_hash,
+                           total_ns == 0 ? 0.0
+                                         : static_cast<double>(times.draw_ns) * 100.0 /
+                                               static_cast<double>(total_ns),
+                           times.count, static_cast<double>(times.draw_ns) / 1000.0 / count,
+                           static_cast<double>(times.vertices) / count);
+    }
+    LOG_INFO(
+        Render_Vulkan,
+        "Draws timed one by one: {:.1f} ms in {} draws of {} pixel shaders, {:.1f} us "
+        "each, with {:.1f} us before each for the render pass and barriers; the most in {}",
+        static_cast<double>(total_ns) / 1'000'000.0, total_count, programs.size(),
+        static_cast<double>(total_ns) / 1000.0 / static_cast<double>(std::max<u64>(total_count, 1)),
+        static_cast<double>(setup_ns) / 1000.0 / static_cast<double>(std::max<u64>(total_count, 1)),
+        top);
 }
 
 void Scheduler::CountWorkRuns(u32 pair, u64 start, u64 end, bool first_run_compute,
@@ -269,8 +325,9 @@ void Scheduler::CountWorkRuns(u32 pair, u64 start, u64 end, bool first_run_compu
     const auto count_run = [&](u64 run_end) {
         run_end = std::min(run_end, end);
         if (run_end > run_start) {
-            const auto ns =
-                static_cast<u64>(static_cast<double>(run_end - run_start) * timestamp_period_ns);
+            // Stands for the command buffers whose runs weren't marked too.
+            const auto ns = static_cast<u64>(static_cast<double>(run_end - run_start) *
+                                             timestamp_period_ns * RunMarkInterval);
             Common::Perf::Count(compute ? Common::Perf::Counter::GpuDispatchRunNs
                                         : Common::Perf::Counter::GpuDrawRunNs,
                                 ns);
@@ -444,6 +501,7 @@ void Scheduler::EndRendering() {
 }
 
 CommandRecorder Scheduler::UploadCommandBuffer() {
+    ++commands_requested;
     auto& session = sessions.back();
     if (!session.has_upload) {
         session.has_upload = true;
@@ -538,7 +596,7 @@ void Scheduler::MarkWorkRun(bool compute) {
     }
     run_compute = compute;
     auto& session = sessions.back();
-    if (session.timestamp_pair == NoTimestamps || !run_pool) {
+    if (!session.mark_runs) {
         return;
     }
     if (session.run_marks.size() == session.run_marks.capacity()) {
@@ -553,7 +611,7 @@ void Scheduler::MarkWorkRun(bool compute) {
 }
 
 void Scheduler::MarkDispatch(DispatchMark mark, u64 program_hash, u32 groups, bool after_draws,
-                             bool compute_ring) {
+                             bool compute_ring, bool is_draw, u64 vertex_hash) {
     if (!sessions.back().time_dispatches) {
         return;
     }
@@ -567,6 +625,8 @@ void Scheduler::MarkDispatch(DispatchMark mark, u64 program_hash, u32 groups, bo
             .after_draws = after_draws,
             .compute_ring = compute_ring,
             .marks = 0,
+            .is_draw = is_draw,
+            .vertex_hash = vertex_hash,
         });
     } else if (timed_dispatches.empty() ||
                timed_dispatches.back().marks != static_cast<u32>(mark)) {
@@ -599,6 +659,10 @@ void Scheduler::BeginSession() {
         session.counts = CountCosts();
         session.thread = std::this_thread::get_id();
         session.first_run_compute = run_compute;
+        session.mark_runs = run_pool && session_id % RunMarkInterval == 0;
+        if (!session.mark_runs) {
+            runs = vk::QueryPool{};
+        }
     }
     Run([this, timestamps, runs, pair](RecordingContext& context) {
         const vk::CommandBufferBeginInfo begin_info = {
@@ -680,9 +744,12 @@ void Scheduler::EndSession() {
 }
 
 void Scheduler::SubmitExecution(SubmitInfo& info) {
+    if (on_pre_submit) {
+        on_pre_submit(info);
+    }
     // The queue is used by other threads too. Commands recorded on the recording thread are
     // submitted there, and only binding sparse memory needs it here.
-    std::unique_lock lk{submit_mutex};
+    std::unique_lock lk{queue_mutex};
     const u64 signal_value = work_semaphore.NextTick();
     work_since_submit = 0;
     Common::Perf::Count(Common::Perf::Counter::Submits);
@@ -726,7 +793,7 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
                 .counts = counts,
                 .first_run_compute = session.first_run_compute,
                 .run_marks = session.run_marks,
-                .run_marks_overflow = !run_pool || session.run_marks_overflow,
+                .run_marks_overflow = !session.mark_runs || session.run_marks_overflow,
             });
         }
     }
@@ -735,13 +802,24 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     const vk::Semaphore timeline = work_semaphore.Handle();
     info.AddSignal(timeline, signal_value);
 
+    // What other threads have to do for the command buffer before it runs is what was asked of
+    // them by now.
+    const u64 host_work = host_work_mark ? host_work_mark() : 0;
     if (stream) {
-        Run([this, info, signal_value](RecordingContext&) {
-            std::scoped_lock lock{submit_mutex};
+        Run([this, info, signal_value, host_work](RecordingContext&) {
+            WaitHostWork(host_work);
+            if (info.submitted_first) {
+                info.submitted_first->WaitSubmitted(info.submitted_first_tick);
+            }
+            std::scoped_lock lock{queue_mutex};
             SubmitRecorded(info, signal_value);
         });
         stream->Publish(true);
     } else {
+        WaitHostWork(host_work);
+        if (info.submitted_first) {
+            info.submitted_first->WaitSubmitted(info.submitted_first_tick);
+        }
         SubmitRecorded(info, signal_value);
     }
 
@@ -753,12 +831,13 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
     PopPendingOperations();
 }
 
-void Scheduler::SubmitRecorded(const SubmitInfo& info, u64 signal_value) {
-    static constexpr std::array<vk::PipelineStageFlags, 2> wait_stage_masks = {
-        vk::PipelineStageFlagBits::eAllCommands,
-        vk::PipelineStageFlagBits::eColorAttachmentOutput,
-    };
+void Scheduler::WaitHostWork(u64 mark) {
+    if (host_work_wait) {
+        host_work_wait(u64{mark});
+    }
+}
 
+void Scheduler::SubmitRecorded(const SubmitInfo& info, u64 signal_value) {
     const vk::TimelineSemaphoreSubmitInfo timeline_si = {
         .waitSemaphoreValueCount = info.num_wait_semas,
         .pWaitSemaphoreValues = info.wait_ticks.data(),
@@ -770,15 +849,17 @@ void Scheduler::SubmitRecorded(const SubmitInfo& info, u64 signal_value) {
         .pNext = &timeline_si,
         .waitSemaphoreCount = info.num_wait_semas,
         .pWaitSemaphores = info.wait_semas.data(),
-        .pWaitDstStageMask = wait_stage_masks.data(),
+        .pWaitDstStageMask = info.wait_stages.data(),
         .commandBufferCount = static_cast<u32>(recorded.size()),
         .pCommandBuffers = recorded.data(),
         .signalSemaphoreCount = info.num_signal_semas,
         .pSignalSemaphores = info.signal_semas.data(),
     };
 
-    ImGui::Core::TextureManager::Submit();
-    auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (on_graphics_queue) {
+        ImGui::Core::TextureManager::Submit();
+    }
+    auto submit_result = queue.submit(submit_info, info.fence);
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     recorded.clear();
 

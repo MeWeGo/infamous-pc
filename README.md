@@ -7,7 +7,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
   <br>
   <a href="https://github.com/MeWeGo/infamous-pc"><img src="https://github.com/MeWeGo/infamous-pc/blob/main/.github/shadps4.png" width="220"></a>
   <br>
-  <b>inFAMOUS High-FPS Custom Build</b>
+  <b>infamous-pc — inFAMOUS High-FPS Custom Build</b>
   <br>
 </h1>
 
@@ -16,255 +16,125 @@ SPDX-License-Identifier: GPL-2.0-or-later
          <img src="https://img.shields.io/discord/1080089157554155590?color=5865F2&label=shadPS4%20Discord&logo=Discord&logoColor=white" width="275">
   <a href="https://github.com/MeWeGo/infamous-pc/releases/latest">
          <img src="https://img.shields.io/github/downloads/MeWeGo/infamous-pc/total.svg" width="140">
-  <a href="https://shadps4.net/">
-         <img src="https://img.shields.io/badge/shadPS4-website-8A2BE2" width="150">
-  <a href="https://x.com/shadps4">
-         <img src="https://img.shields.io/badge/-Join%20us-black?logo=X&logoColor=white" width="100">
   <a href="https://github.com/MeWeGo/infamous-pc/stargazers">
          <img src="https://img.shields.io/github/stars/MeWeGo/infamous-pc" width="120">
 </h1>
 
-# inFAMOUS High-FPS Custom Build
+# infamous-pc — inFAMOUS High-FPS Custom Build
 
-> Fork of [shadPS4](https://github.com/shadps4-emu/shadPS4) focused on **inFAMOUS Second Son** and **inFAMOUS First Light**.
+> Fork of [shadPS4](https://github.com/shadps4-emu/shadPS4) (via [rayhlancaner-png/shadPS4-Infamous-FixBuild](https://github.com/rayhlancaner-png/shadPS4-Infamous-FixBuild)) focused on **inFAMOUS Second Son** (CUSA00223) and **inFAMOUS First Light** at high framerates, with graphics fixes and color corrections.
 
-This repository and branch is a custom build of shadPS4 focused on providing dedicated fixes to run **inFAMOUS Second Son** and **inFAMOUS First Light** at high framerates, as well as addressing various graphical issues and color corrections.
-
-- **Developers / Geliştiriciler:** Eye Of The Ruins, 0xDeftones
-
-> [!NOTE]
-> Various bugs and glitches may still be present, but the primary focus of this build is to deliver maximum performance.
->
-> Uncompiled shaders may cause initial stuttering, but gameplay becomes significantly smoother as shaders are compiled. Any potential stuttering is related to the emulator's shader compilation process.
-
-### Performance Comparison vs Main Branch / Performans Karşılaştırması
-
-**Test System / Test Sistemi:** AMD Ryzen 9 7950X CPU, NVIDIA GeForce RTX 4090 GPU
-
-| Before (Main Branch) | After (Custom Build) |
-| :-------------------: | :------------------: |
-| ![Before (Main Branch)](./ss/before.jpg) | ![After (Custom Build)](./ss/after.jpg) |
-
-### Recommended Settings
-
-- **FSR:** Do **NOT** enable FSR under any circumstances; it causes graphical corruption.
-- **Debug:**
-  - **Readbacks Mode:** Must be set to `Precise`.
-  - **Enable Direct Memory Access:** Must be enabled (ON).
-  - **Enable Shader Cache:** Must be enabled (ON).
-- **Vblank Frequency:** Must be configured according to your desired target framerate.
-
----
-
-### Özel Sürüm Bilgisi (inFAMOUS Yüksek FPS Build)
-
-Bu repo ve branch, **inFAMOUS Second Son** ve **inFAMOUS First Light** oyunlarını yüksek kare hızında oynamayı sağlayan düzeltmelerin (fixler) yanı sıra çeşitli grafiksel sorunları gideren ve renk düzeltmeleri içeren özel bir derlemedir (custom build).
-
-- **Geliştiriciler:** Eye Of The Ruins, 0xDeftones
+- **Custom build developers:** Eye Of The Ruins, 0xDeftones
+- **Default branch:** `claude/dazzling-cori-h1dhwi`
 
 > [!NOTE]
-> Çeşitli buglar ve hatalar halen mevcut olabilir, ancak bu derlemenin temel amacı yüksek performans sağlamaktır.
->
-> Daha önce shader compile olmamış durumlar ilk başta kasmaya ve takılmalara yol açabilir, fakat shader compile oldukça oyun çok daha akıcı hale gelecektir. Bu sebeple karşılaşılabilecek olası takılmalar emülatörün kendi shader compile işlemi ile alakalıdır.
+> Bugs and glitches may remain. The goal of this build is maximum performance on inFAMOUS.
+> First-time stutter is expected while shaders compile; it smooths out as the shader cache fills. Do not delete the shader cache.
 
-#### Önerilen Ayarlar
+## What is included
 
-- **FSR:** Kesinlikle açılmamalı, grafiksel bozulmalara yol açıyor.
-- **Debug:**
-  - **Readbacks Mode:** Değeri `Precise` olmalı.
-  - **Enable Direct Memory Access:** Açık olmalı.
-  - **Enable Shader Cache:** Açık olmalı.
-- **Vblank Frequency:** İstenilen kare hızına göre ayarlanmış olmalı.
+Merged parent work (1.0.10–1.0.16 line, 51 commits) **plus** this fork's 30 commits:
 
----
+- **Performance:** second compute queue / async compute path (`SHADPS4_ASYNC_COMPUTE=1` to enable, `=0` kill-switch), upload worker off the GPU thread, gigabyte uploads in parts, deferred readback (only the waiting thread waits), narrower draw barriers, recorder-thread descriptor sets, texture/binding fast paths.
+- **Stability / VRAM:** retry residency allocation on OOM with memory-use logging, allocate past budget instead of failing, pageable device-local memory, retry pipeline creation when the driver fails, persistent driver `VkPipelineCache`.
+- **Shaders:** BP01–BP12 backports, wave64 ballot lowering with exhaustive order-independent uniformity check (`ReachesLaneVaryingSource`), shared-memory (LDS) barriers, SDWA compare + unnormalized-sampler fixes, shader patches applied to cached shaders, compute pipeline async build.
+- **Input:** gamepad touchpad swipes, stick-driven touchpad fingers (L3/R3), touchpad finger-activity logging, GPU draw timing.
+- **Tuning without rebuild:** `SHAD_*` env vars (see below) + `infamous-tuning.patch`.
 
-|               Bloodborne by From Software                   |                     Hatsune Miku Project DIVA Future Tone by SEGA                         |
-| :-----------------------------------------------------------: | :--------------------------------------------------------------------------------------------: |
-| ![Bloodborne screenshot](./documents/Screenshots/1.png) | ![Project DIVA screenshot](./documents/Screenshots/2.png) |
+### Performance comparison
 
-|                  Yakuza 0 by SEGA                     |                 DRIVECLUB™ by Evolution Studios                    |
-| :------------------------------------------------------------------------: | :------------------------------------------------------------------: |
-| ![Yakuza screenshot](./documents/Screenshots/3.png) | ![DRIVECLUB screenshot](./documents/Screenshots/4.png) |
+**Test system:** AMD Ryzen 9 7950X, NVIDIA GeForce RTX 4090
 
-# General information
+| Before (main) | After (custom build) |
+| :-----------: | :------------------: |
+| ![Before](./ss/before.jpg) | ![After](./ss/after.jpg) |
 
-**shadPS4** is an early **PlayStation 4** emulator for **Windows**, **Linux** and **macOS** written in C++.
+## Recommended settings
 
-> [!IMPORTANT]
-> This is the emulator core, which does not include a GUI. If you just want to use the emulator as an end user, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases) instead.
+- **FSR:** OFF — causes graphical corruption in inFAMOUS.
+- **Debug → Readbacks:** `Precise`.
+- **Debug → Direct Memory Access:** ON.
+- **Debug → Shader Cache:** ON.
+- **Vblank Frequency:** set to your target framerate.
 
-If you encounter problems or have doubts, do not hesitate to look at the [**Quickstart**](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D).\
-To verify that a game works, you can look at [**shadPS4 Game Compatibility**](https://github.com/shadps4-compatibility/shadps4-game-compatibility).\
-To discuss shadPS4 development, suggest ideas or to ask for help, join our [**Discord server**](https://discord.gg/bFJxfftGW6).\
-To get the latest news, go to our [**X (Twitter)**](https://x.com/shadps4) or our [**website**](https://shadps4.net/).\
-You can donate to the project via our [**Kofi page**](https://ko-fi.com/shadps4).
+### 4 GB VRAM
 
-# Status
+This build includes the VRAM pressure fixes (release old textures, retry instead of closing, part-wise uploads, e.g. save loads). If you still hit issues on 4 GB cards:
 
-> [!IMPORTANT]
-> shadPS4 is early in development, don't expect a flawless experience.
+- Keep Shader Cache ON, close other GPU apps.
+- Keep the shader cache (`%APPDATA%\shadPS4\cache\<CUSA>`); first sight of a new effect (new power) stutters once, then loads at startup.
 
-Currently, the emulator can successfully run games like [**Bloodborne**](https://www.youtube.com/watch?v=5sZgWyVflFM), [**Dark Souls Remastered**](https://www.youtube.com/watch?v=-3PA-Xwszts), [**Red Dead Redemption**](https://www.youtube.com/watch?v=Al7yz_5nLag), and many other games.
+## Tuning knobs (no rebuild)
 
-# Why
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `SHADPS4_ASYNC_COMPUTE` | off | `1` routes eligible compute to second queue, `0` force off |
+| `SHAD_READBACK_WINDOW_KB` | 512 (this fork: 1024) | GPU readback window size |
+| `SHAD_HOT_WINDOW_SECS` | 5 | How long read-back memory is copied ahead |
+| `SHAD_PREFETCH_BACKOFF_MAX` | 7 | Stale-window backoff |
+| `SHAD_PREFETCH_OFF` | 0 | `1` disables readback prefetch |
+| `SHAD_AHEAD_MINRUN` / `SHAD_AHEAD_MAX` / `SHAD_AHEAD_BASE` | 2 / 16 / 4 | Page-invalidation lookahead (`MAX=64` restores wide scan) |
 
-This project began for fun. Given our limited free time, it may take some time before shadPS4 can run more complex games, but we're committed to making small, regular updates.
+Example (Windows `cmd`): `set SHAD_READBACK_WINDOW_KB=1024 && shadps4.exe -g CUSA00223`
 
-# Building
+## Controls
 
-## Docker
-
-For building shadPS4 in a containerized environment using Docker and VSCode, check the instructions here:  
-[**Docker Build Instructions**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-docker.md)
-
-## Windows
-
-Check the build instructions for [**Windows**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-windows.md).
-
-## Linux
-
-Check the build instructions for [**Linux**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-linux.md).
-
-## macOS
-
-Check the build instructions for [**macOS**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/building-macos.md).
-
-> [!IMPORTANT]
-> macOS users need at least macOS 26.0 to run shadPS4. Intel Macs are not supported.
-
-# Usage examples
-
-> [!IMPORTANT]
-> For a user-friendly GUI, download the [**QtLauncher**](https://github.com/shadps4-emu/shadps4-qtlauncher/releases).
-
-To get the list of all available commands and also a more detailed description of what each command does, please refer to the `--help` flag's output.
-
-Below is a list of commonly used command patterns:
-```sh
-shadPS4 CUSA00001 # Searches for a game folder called CUSA00001 in the list of game install folders, and boots it.
-shadPS4 --fullscreen true --config-clean CUSA00001    # the game argument is always the last one,
-shadPS4 -g CUSA00001 --fullscreen true --config-clean # ...unless manually specified otherwise.
-shadPS4 /path/to/game.elf # Boots a PS4 ELF file directly. Useful if you want to boot an executable that is not named eboot.bin.
-shadPS4 CUSA00001 -- -flag1 -flag2 # Passes '-flag1' and '-flag2' to the game executable in argv.
-```
-
-# Debugging and reporting issues
-
-For more information on how to test, debug and report issues with the emulator or games, read the [**Debugging documentation**](https://github.com/MeWeGo/infamous-pc/blob/main/documents/Debugging/Debugging.md).
-
-# Keyboard and Mouse Mappings
-
-> [!NOTE]
-> Some keyboards may also require you to hold the Fn key to use the F\* keys. Mac users should use the Command key instead of Control, and need to use Command+F11 for full screen to avoid conflicting with system key bindings.
+- Xbox / DualShock / DualSense work out of the box.
+- Touchpad: gamepad swipe + L3/R3 stick-driven fingers; two-finger swipes supported.
+- Keyboard fallback: see in-app Controller settings (per-game bindings, up to 3 keys per action).
 
 | Button | Function |
-|-------------|-------------|
-F10 | FPS Counter
-Ctrl+F10 | Video Debug Info
-F11 | Fullscreen
-F12 | Trigger RenderDoc Capture (or game-only screenshot if RenderDoc is unavailable)
-Alt+F12 | Capture screenshot including HUD/dialog overlays
+| --- | --- |
+| F10 | FPS counter |
+| F11 | Fullscreen |
+| F12 | RenderDoc capture (or screenshot) |
 
-> [!NOTE]
-> Xbox and DualShock controllers work out of the box.
+## Building
 
-| Controller button | Keyboard equivalent |
-|-------------|-------------|
-LEFT AXIS UP | W |
-LEFT AXIS DOWN | S |
-LEFT AXIS LEFT | A |
-LEFT AXIS RIGHT | D |
-RIGHT AXIS UP | I |
-RIGHT AXIS DOWN | K |
-RIGHT AXIS LEFT | J |
-RIGHT AXIS RIGHT | L |
-TRIANGLE | Numpad 8 or C |
-CIRCLE | Numpad 6 or B |
-CROSS | Numpad 2 or N |
-SQUARE | Numpad 4 or V |
-PAD UP | UP |
-PAD DOWN | DOWN |
-PAD LEFT | LEFT |
-PAD RIGHT | RIGHT |
-OPTIONS | RETURN |
-BACK BUTTON / TOUCH PAD | SPACE |
-L1 | Q |
-R1 | U |
-L2 | E |
-R2 | O |
-L3 | X |
-R3 | M |
+```sh
+git clone --recursive https://github.com/MeWeGo/infamous-pc.git
+cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+```
 
-Keyboard and mouse inputs can be customized in the settings menu by clicking the Controller button, and further details and help on controls are  also found there. Custom bindings are saved per-game. Inputs support up to three keys per binding, mouse buttons, mouse movement mapped to joystick input, and more.
+Docs: [Windows](./documents/building-windows.md) · [Linux](./documents/building-linux.md) · [macOS](./documents/building-macos.md) · [Docker](./documents/building-docker.md) · [Debugging](./documents/Debugging/Debugging.md)
 
+Upstream help: [Quickstart](https://github.com/shadps4-emu/shadPS4/wiki/I.-Quick-start-%5BUsers%5D) · [Compatibility](https://github.com/shadps4-compatibility/shadps4-game-compatibility)
 
-# Firmware files
+## Running inFAMOUS
 
-shadPS4 can load some PlayStation 4 firmware files.
-The following firmware modules are supported and must be placed in shadPS4's `sys_modules` folder.
+```sh
+shadps4.exe --show-fps -g "<path-to>\CUSA00223-merged\eboot.bin"
+```
 
-<div align="center">
+- You must dump the game and firmware (`sys_modules`) from your own PS4. No game files are included.
+- First boot compiles shaders — expect stutter, then smoother play.
 
-| Modules                        | Modules                        | Modules                        | Modules                        |
-|--------------------------------|--------------------------------|--------------------------------|--------------------------------|
-| libSceAt9Enc.sprx              | libSceAudiodec.sprx            | libSceAudiodecCpu.sprx         | libSceAudiodecCpuDdp.sprx      |
-| libSceAudiodecCpuDtsHdLbr.sprx | libSceAudiodecCpuHevag.sprx    | libSceAudiodecCpuM4aac.sprx    | libSceAvPlayer.sprx            |
-| libSceAvPlayerStreaming.sprx   | libSceBeisobmf.sprx            | libSceBemp2sys.sprx            | libSceCesCs.sprx               |
-| libSceFont.sprx                | libSceFontFt.sprx              | libSceFreeTypeOl.sprx          | libSceFreeTypeOptOl.sprx       |
-| libSceFreeTypeOt.sprx          | libSceJpegDec.sprx             | libSceJpegEnc.sprx             | libSceJson.sprx                |
-| libSceJson2.sprx               | libSceLibcInternal.sprx        | libSceNgs2.sprx                | libScePngEnc.sprx              |
-| libScePsmKitSystem.sprx        | libSceRtc.sprx                 | libSceRudp.sprx                | libSceSystemGesture.sprx       |
-| libSceUlt.sprx                 | libSceWkFontConfig.sprx        | libSceXml.sprx                 | libSceDepth.sprx               |
-| libScePadTracker.sprx          | libSceMoveTracker.sprx         |
-</div>
+## Tests
 
-> [!Caution]
-> The above modules are required to run the games properly and must be dumped from your legally owned PlayStation 4 console.
+```sh
+cmake -S . -B build -DENABLE_TESTS=ON
+cmake --build build --target shadps4_gcn_test shadps4_settings_test
+./build/tests/shadps4_gcn_test --gtest_filter='Wave64*'
+```
 
+Covers `ReachesLaneVaryingSource` order-independence, wave64 reduction folding, and subgroup vs workgroup barriers.
 
+## Credits
 
-# Main team / Geliştiriciler
+### Custom build
+- **Eye Of The Ruins, 0xDeftones**
+- Parent build: [rayhlancaner-png](https://github.com/rayhlancaner-png/shadPS4-Infamous-FixBuild), TOXIC-KID (#6 4 GB OOM fix)
 
-### Custom Build Developers
-- **Eye Of The Ruins**
-- **0xDeftones**
-
-### Upstream shadPS4 Team
-- [**georgemoralis**](https://github.com/georgemoralis)
-- [**psucien**](https://github.com/psucien)
-- [**viniciuslrangel**](https://github.com/viniciuslrangel)
-- [**roamic**](https://github.com/roamic)
-- [**squidbus**](https://github.com/squidbus)
-- [**frodo**](https://github.com/baggins183)
-- [**Stephen Miller**](https://github.com/StevenMiller123)
-- [**kalaposfos13**](https://github.com/kalaposfos13)
-
-Logo is done by [**Xphalnos**](https://github.com/Xphalnos)
+### Upstream shadPS4
+- [georgemoralis](https://github.com/georgemoralis) · [psucien](https://github.com/psucien) · [viniciuslrangel](https://github.com/viniciuslrangel) · [roamic](https://github.com/roamic) · [squidbus](https://github.com/squidbus) · [frodo](https://github.com/baggins183) · [Stephen Miller](https://github.com/StevenMiller123) · [kalaposfos13](https://github.com/kalaposfos13)
+- Logo by [Xphalnos](https://github.com/Xphalnos)
 
 <a href="https://github.com/MeWeGo/infamous-pc/graphs/contributors">
   <img src="https://contrib.rocks/image?repo=MeWeGo/infamous-pc&max=24">
 </a>
 
-# Contributing
+## License
 
-If you want to contribute, please read the [**CONTRIBUTING.md**](https://github.com/MeWeGo/infamous-pc/blob/main/CONTRIBUTING.md) file.\
-Open a PR and we'll check it :)
-
-
-# Special Thanks
-
-A few noteworthy teams/projects who've helped us along the way are:
-
-- [**Panda3DS**](https://github.com/wheremyfoodat/Panda3DS): A multiplatform 3DS emulator from our co-author wheremyfoodat. They have been incredibly helpful in understanding and solving problems that came up from natively executing the x64 code of PS4 binaries
-
-- [**fpPS4**](https://github.com/red-prig/fpPS4): The fpPS4 team has assisted massively with understanding some of the more complex parts of the PS4 operating system and libraries, by helping with reverse engineering work and research.
-
-- **yuzu**: Our shader compiler has been designed with yuzu's Hades compiler as a blueprint. This allowed us to focus on the challenges of emulating a modern AMD GPU while having a high-quality optimizing shader compiler implementation as a base.
-
-- [**felix86**](https://github.com/OFFTKP/felix86): A new x86-64 → RISC-V Linux userspace emulator
-
-- [**emudev.org**](https://emudev.org/): A network of people interested in the documentation, emulation, simulation and re-implementation of hardware near extinction . Belongs to my friend skmp and me (shadow) also a member of it
-
-# License
-
-- [**GPL-2.0 license**](https://github.com/MeWeGo/infamous-pc/blob/main/LICENSE)
+- [GPL-2.0](https://github.com/MeWeGo/infamous-pc/blob/main/LICENSE)
+- Upstream: [shadps4-emu/shadPS4](https://github.com/shadps4-emu/shadPS4)

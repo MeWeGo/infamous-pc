@@ -22,6 +22,7 @@
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/buffer_cache/fault_manager.h"
 #include "video_core/buffer_cache/range_set.h"
+#include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 
@@ -58,12 +59,29 @@ class BufferCache {
     static constexpr u64 REWRITE_STREAM_THRESHOLD = 512_KB;
     /// At most this much of it is copied a frame, the rest is uploaded.
     static constexpr u64 MaxRewriteCopyBytes = 32_MB;
+    /// Uploads are only left to the upload thread up to this size, and while it has less than
+    /// this much to copy. When the game loads, gigabytes are uploaded within a frame, and staging
+    /// memory can't be used again until the command buffers copying from it are submitted and done,
+    /// which they aren't while the thread catches up, so it ran the GPU out of memory.
+    static constexpr u64 MaxDeferredUploadBytes = 8_MB;
+    static constexpr u64 MaxPendingUploadBytes = 64_MB;
+    /// Uploads larger than this are copied through staging memory of this size, a part at a time.
+    /// Loading a save in inFAMOUS Second Son, one draw reads 2.4 GB the game wrote all at once,
+    /// and staging memory that large couldn't be allocated while other programs held some.
+    static constexpr u64 MaxUploadPartBytes = 256_MB;
+    /// Buffers read from at least this large are uploaded once until the game could next have
+    /// written them for the GPU, see LargeReadSynced.
+    static constexpr u64 LARGE_READ_THRESHOLD = 64_MB;
 
 public:
     explicit BufferCache(const Vulkan::Instance& instance, Vulkan::Scheduler& scheduler,
                          Vulkan::Runtime& runtime, AmdGpu::Liverpool* liverpool,
                          TextureCache& texture_cache, PageManager& tracker);
     ~BufferCache();
+
+    /// Makes a scheduler wait, before it submits, for the uploads copied on a thread of their own
+    /// that were asked for by then.
+    void SetHostWorkOn(Vulkan::Scheduler& target);
 
     /// Returns a pointer to GDS device local buffer.
     [[nodiscard]] const Buffer* GetGdsBuffer() const noexcept {
@@ -160,10 +178,14 @@ public:
 
     /// Finds a buffer for the specified region. is_read_tracked tells that the caller reports
     /// its accesses to the runtime, which lets small reads use the cached copy in place.
+    /// Obtains a buffer for the specified region. When unwritten is given, it is set if the range
+    /// returned is known to have nothing written to it since the last barrier, so the caller
+    /// needn't find that out again.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBuffer(VAddr device_addr, u32 size,
                                                              bool is_written,
                                                              bool is_texel_buffer = false,
-                                                             bool is_read_tracked = false);
+                                                             bool is_read_tracked = false,
+                                                             bool* unwritten = nullptr);
 
     /// Attempts to obtain a buffer without modifying the cache contents.
     [[nodiscard]] std::pair<const Buffer*, u64> ObtainBufferForImage(VAddr device_addr, u32 size);
@@ -192,6 +214,8 @@ private:
         VAddr arena_base{};
         VAddr start{};
         VAddr end{};
+        /// The copy is done once the semaphore of the queue it is on reaches the tick.
+        Vulkan::Semaphore* semaphore{};
         u64 tick{};
         /// True when the copy runs on the readback queue and the tick is on its
         /// timeline; false for the graphics queue's timeline.
@@ -216,12 +240,16 @@ private:
         }
     };
 
+    /// Tells the runtime memory is bound to buffers by the next graphics submit.
+    void NoteResidencyChange();
+
     struct ArenaBinds {
         const Buffer* arena;
         boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
     };
 
     ArenaBinds* BindsForArena(const Buffer* arena) {
+        NoteResidencyChange();
         auto it = std::ranges::find(pending_binds, arena, &ArenaBinds::arena);
         if (it != pending_binds.end()) {
             return std::addressof(*it);
@@ -270,11 +298,18 @@ private:
     /// Writes back copies made ahead as soon as the GPU is done with them.
     void ReadbackThread(std::stop_token token);
 
+    /// Protects the pages of uploads and copies their memory to staging, in the order the GPU
+    /// thread asked for it.
+    void UploadThread(std::stop_token token);
+
     /// Counts a copy made ahead for or against copying its window ahead again. GPU thread.
     void RatePrefetch(Readback& readback, bool useful);
 
     /// Records a copy back of the GPU modified memory in a window, or returns null if there is
     /// none. GPU thread.
+    /// Submits the copies back recorded, on the queues they are on.
+    void SubmitReadbacks(bool on_graphics, bool on_async);
+
     std::shared_ptr<Readback> RecordReadback(const Buffer* arena, VAddr start, VAddr end,
                                              bool record_copy = true);
 
@@ -288,6 +323,17 @@ private:
 
     bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
 
+    /// Uploads the ranges, guest addresses in dstOffset, MaxUploadPartBytes at a time, waiting
+    /// for the GPU to copy each part before the staging memory is filled with the next.
+    void UploadInParts(const Buffer* arena, std::span<const vk::BufferCopy> ranges);
+
+    /// Adds a range to the GPU modified ones, unless it is in them already. GPU thread.
+    void MarkGpuModifiedRange(VAddr device_addr, u64 size);
+
+    /// Returns true if a large range read from was uploaded since the game last could have
+    /// written memory for the GPU to read, and notes that it is about to be if not. GPU thread.
+    bool LargeReadSynced(VAddr device_addr, u64 size);
+
     const Vulkan::Instance& instance;
     Vulkan::Scheduler& scheduler;
     Vulkan::Runtime& runtime;
@@ -295,11 +341,15 @@ private:
     AmdGpu::Liverpool* liverpool;
     Core::MemoryManager* memory;
     TextureCache& texture_cache;
+    PageManager& page_manager;
     std::unique_ptr<MemoryTracker> memory_tracker;
 
     StreamBuffer stream_buffer;
     Buffer gds_buffer;
     RangeSet gpu_modified_ranges;
+    /// Ranges lately found in or added to gpu_modified_ranges, until some of them is taken out.
+    std::array<std::pair<VAddr, VAddr>, 16> gpu_modified_hints{};
+    size_t next_gpu_modified_hint{};
     std::vector<std::shared_ptr<Readback>> readbacks;
 
     /// Windows game threads read back recently, which are copied back ahead.
@@ -370,6 +420,15 @@ private:
     u64 rewrite_copy_bytes{};
     /// The CPU modified generation all memory in use was last uploaded at for such shaders.
     u64 dma_synced_generation{};
+    struct LargeRead {
+        VAddr address{};
+        u64 size{};
+        u64 sync_count{};
+    };
+    /// Large ranges read from and the Liverpool::sync_count they were last uploaded at.
+    std::array<LargeRead, 8> large_reads{};
+    /// Whether large ranges read from are uploaded only once in between, see LargeReadSynced.
+    bool sync_large_reads_once{true};
 
     std::array<const Buffer*, NUM_ARENA_PAGES> address_space{};
     std::deque<Buffer> arenas;
@@ -387,8 +446,13 @@ private:
         }
     };
     IntervalList<Backing> resident_ranges;
+    /// Resident ranges memory was lately found in, in blocks, see EnsureResident.
+    std::array<std::pair<u64, u64>, 16> resident_hints{};
+    size_t next_resident_hint{};
     vk::DeviceMemory residency_chunk{};
     u64 residency_chunk_used{};
+    /// Device memory allocated for residency so far, for the log when an allocation fails.
+    u64 residency_allocated_bytes{};
 
     u32 arena_memory_type_index{};
     u32 block_size{};
@@ -400,7 +464,7 @@ private:
     std::deque<std::shared_ptr<Readback>> finished_readbacks;
     std::mutex finished_readbacks_mutex;
     std::condition_variable_any finished_readbacks_cv;
-    /// Declared last so it stops before anything it uses goes away.
+    /// Declared after what it uses, so it stops before any of that goes away.
     std::jthread readback_thread;
 
     /// Copies guest memory into staging and applies the page protections of the uploads
@@ -476,6 +540,29 @@ private:
     bool last_write_on_compute{};
     /// Submits the open compute batch before a readback that covers its writes.
     std::function<void()> compute_batch_flusher{};
+    /// What uploading memory the CPU wrote leaves to a thread of its own: protecting its pages
+    /// again, so the CPU's next writes to them are seen, and copying it to staging after that.
+    /// The GPU thread spent a tenth of its time on it, most of it in the system changing the
+    /// protection. The command buffer the upload is recorded in is only submitted once it is done.
+    struct HostUpload {
+        PageManager::PendingProtection protects;
+        boost::container::small_vector<std::tuple<VAddr, u8*, u64>, 4> copies;
+        Vulkan::StagingBufferRef staging{};
+    };
+    /// Shared with the scheduler, which waits on it to submit, so it outlives the buffer cache.
+    struct HostUploads {
+        std::mutex mutex;
+        std::condition_variable_any cv;
+        std::deque<HostUpload> queue;
+        std::atomic<u64> queued{};
+        std::atomic<u64> done{};
+        /// Bytes queued to be copied and not copied yet.
+        std::atomic<u64> pending_bytes{};
+    };
+    std::shared_ptr<HostUploads> host_uploads = std::make_shared<HostUploads>();
+    /// Whether uploads are left to that thread.
+    bool defer_uploads{true};
+    std::jthread upload_thread;
     /// Declared after the staging pool and the tracker so it stops before they go away.
 };
 

@@ -454,12 +454,313 @@ private:
     std::vector<std::unique_ptr<std::array<Group, GroupsPerLeaf>>> groups;
 };
 
+/**
+ * Ranges of a buffer the GPU accessed in an epoch, kept to the byte as a list.
+ *
+ * Rounding accesses out to the granules of AccessTracker made ones next to each other look like
+ * they overlap. inFAMOUS Second Son runs hundreds of tiny dispatches a frame that each write 24
+ * bytes next to where the one before wrote, and every one of them got a barrier, waiting for the
+ * one before to finish. Ends of larger ranges rounded out the same way. Accesses are kept here
+ * instead, up to a number of them an epoch, and only the ones that don't fit go to the tracker.
+ * Adding one is cheap, and checks of memory far from all of them stop at their bounds.
+ */
+template <size_t Capacity>
+class ExactRanges {
+public:
+    /// Keeps [start, end) as accessed in the epoch. Returns false if no more fit, and it has to
+    /// be marked in the tracker.
+    bool Add(u64 start, u64 end, u64 epoch) {
+        if (start >= end) [[unlikely]] {
+            return true;
+        }
+        if (epoch != current_epoch) {
+            current_epoch = epoch;
+            count = 0;
+            low = ~u64{0};
+            high = 0;
+        }
+        // Draws mostly bind what the few draws before them did.
+        for (size_t i = count, seen = 0; i > 0 && seen < 4; --i, ++seen) {
+            if (ranges[i - 1].start == start && ranges[i - 1].end == end) {
+                return true;
+            }
+        }
+        if (count == Capacity) {
+            return false;
+        }
+        ranges[count++] = {start, end};
+        low = std::min(low, start);
+        high = std::max(high, end);
+        return true;
+    }
+
+    /// Returns true if any of [start, end) was kept as accessed in the epoch.
+    [[nodiscard]] bool Overlaps(u64 start, u64 end, u64 epoch) const {
+        if (epoch != current_epoch || end <= low || start >= high) {
+            return false;
+        }
+        for (size_t i = 0; i < count; ++i) {
+            if (ranges[i].start < end && start < ranges[i].end) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    struct Range {
+        u64 start;
+        u64 end;
+    };
+
+    std::array<Range, Capacity> ranges{};
+    size_t count{};
+    u64 current_epoch{};
+    /// Bounds of the ranges kept.
+    u64 low{~u64{0}};
+    u64 high{};
+};
+
+/**
+ * Pages of a buffer the GPU touched in a session, as a flat bitmap with a bit for each 4 KB.
+ *
+ * Every buffer a draw binds is noted as touched in the session, over 50000 times a frame in
+ * inFAMOUS Second Son, and marking each in an AccessTracker went through its headers, a cache miss
+ * at each level. It is only asked about memory uploads copy to, which comes a page at a time, so
+ * keeping pages answers the same. A word covers 64 pages and is marked with the session it was
+ * marked in, and a chunk of 64 words can be marked whole, so ranges of any length cost a word or
+ * two at their ends.
+ */
+class SessionPages {
+public:
+    static constexpr u64 PageBits = 12;
+
+    /// Marks [start, end) touched in the session.
+    void Add(u64 start, u64 end, u64 session) {
+        if (start >= end) [[unlikely]] {
+            return;
+        }
+        const u64 first_page = start >> PageBits;
+        const u64 last_page = (end - 1) >> PageBits;
+        const u64 first_word = first_page >> 6;
+        const u64 last_word = last_page >> 6;
+        if (last_word >= words.size()) {
+            words.resize(last_word + 1);
+            chunks.resize((last_word >> 6) + 1);
+        }
+        if (first_word == last_word) [[likely]] {
+            MarkWord(first_word, BitRange(first_page & 63, last_page & 63), session);
+            return;
+        }
+        // Draws bind a few ranges of hundreds of megabytes over and over, and marking one costs a
+        // chunk for each 16 MB of it.
+        if (last_word - first_word > 64) {
+            Range& large = large_ranges[(first_word ^ last_word) % large_ranges.size()];
+            if (large.start == start && large.end == end && large.session == session) {
+                return;
+            }
+            large = {start, end, session};
+        }
+        MarkWord(first_word, BitRange(first_page & 63, 63), session);
+        MarkWord(last_word, BitRange(0, last_page & 63), session);
+        // The words in between are covered whole, which their chunks note.
+        if (last_word - first_word < 2) {
+            return;
+        }
+        const u64 lo = first_word + 1;
+        const u64 hi = last_word - 1;
+        for (u64 chunk = lo >> 6; chunk <= hi >> 6; ++chunk) {
+            const u64 base = chunk << 6;
+            MarkChunk(chunk, BitRange(std::max(lo, base) - base, std::min(hi, base + 63) - base),
+                      session);
+        }
+    }
+
+    /// Returns true if any page of [start, end) was touched in the session.
+    [[nodiscard]] bool Overlaps(u64 start, u64 end, u64 session) const {
+        if (start >= end || words.empty()) {
+            return false;
+        }
+        const u64 first_page = start >> PageBits;
+        const u64 last_page = (end - 1) >> PageBits;
+        const u64 first_word = first_page >> 6;
+        const u64 last_word = std::min<u64>(last_page >> 6, words.size() - 1);
+        for (u64 word = first_word; word <= last_word; ++word) {
+            const Chunk& chunk = chunks[word >> 6];
+            if (chunk.session == session && (chunk.full_words & Bit(word & 63)) != 0) {
+                return true;
+            }
+            const u64 mask = BitRange(word == first_word ? first_page & 63 : 0,
+                                      word == (last_page >> 6) ? last_page & 63 : 63);
+            if (words[word].session == session && (words[word].pages & mask) != 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    /// The pages of 256 KB marked in a session.
+    struct Word {
+        u64 session{};
+        u64 pages{};
+    };
+
+    /// The words of 16 MB marked whole in a session.
+    struct Chunk {
+        u64 session{};
+        u64 full_words{};
+    };
+
+    static constexpr u64 Bit(u64 index) {
+        return u64{1} << index;
+    }
+
+    /// Bits lo to hi inclusive, both below 64.
+    static constexpr u64 BitRange(u64 lo, u64 hi) {
+        return (~u64{0} << lo) & (~u64{0} >> (63 - hi));
+    }
+
+    void MarkWord(u64 index, u64 mask, u64 session) {
+        Word& word = words[index];
+        if (word.session != session) {
+            word = {session, mask};
+        } else {
+            word.pages |= mask;
+        }
+    }
+
+    void MarkChunk(u64 index, u64 mask, u64 session) {
+        Chunk& chunk = chunks[index];
+        if (chunk.session != session) {
+            chunk = {session, mask};
+        } else {
+            chunk.full_words |= mask;
+        }
+    }
+
+    /// A large range marked lately, and the session it was marked in.
+    struct Range {
+        u64 start{};
+        u64 end{};
+        u64 session{};
+    };
+
+    std::vector<Word> words;
+    std::vector<Chunk> chunks;
+    std::array<Range, 4> large_ranges{};
+};
+
+/**
+ * Pages of a buffer the graphics queue reads and writes in work it may not have done yet, for work
+ * on another queue to keep clear of. Each page keeps the last tick that touched it and the last
+ * that wrote it, and each chunk of 64 words of 64 pages the same for the words marked whole, so
+ * ranges of any length cost two words at their ends to mark. Keeping only the pages touched since
+ * the last tick known done for each word instead, words the graphics queue touches in every
+ * command buffer never got clear: nine in ten compute ring dispatches waited for graphics work in
+ * flight, against two in three with the ticks kept per page.
+ */
+class InFlightPages {
+public:
+    static constexpr u64 PageBits = 12;
+
+    /// Notes [start, end) touched, and written if it was, by work of the tick.
+    void Add(u64 start, u64 end, u64 tick, bool written) {
+        if (start >= end) [[unlikely]] {
+            return;
+        }
+        const u64 first_page = start >> PageBits;
+        const u64 last_page = (end - 1) >> PageBits;
+        const u64 first_word = first_page >> 6;
+        const u64 last_word = last_page >> 6;
+        if (last_word >= words.size()) {
+            words.resize(last_word + 1);
+            chunks.resize((last_word >> 6) + 1);
+        }
+        const u32 t = static_cast<u32>(tick);
+        if (last_word - first_word < 2) {
+            for (u64 page = first_page; page <= last_page; ++page) {
+                Mark(words[page >> 6], page & 63, t, written);
+            }
+            return;
+        }
+        for (u64 page = first_page; page < ((first_word + 1) << 6); ++page) {
+            Mark(words[first_word], page & 63, t, written);
+        }
+        for (u64 page = last_word << 6; page <= last_page; ++page) {
+            Mark(words[last_word], page & 63, t, written);
+        }
+        for (u64 word = first_word + 1; word < last_word; ++word) {
+            Mark(chunks[word >> 6], word & 63, t, written);
+        }
+    }
+
+    /// Returns the last tick of work not done yet that touched any page of [start, end), or wrote
+    /// one if only writes count, or zero if there is none.
+    [[nodiscard]] u64 LastTick(u64 start, u64 end, u64 done_tick, bool only_written) const {
+        if (start >= end || words.empty()) {
+            return 0;
+        }
+        const u64 first_page = start >> PageBits;
+        const u64 last_page = std::min<u64>((end - 1) >> PageBits, (words.size() << 6) - 1);
+        const u32 done = static_cast<u32>(done_tick);
+        u32 last = 0;
+        const auto check = [&](const Entry& entry, u64 index) {
+            const u32 t = only_written ? entry.written[index] : entry.touched[index];
+            if (t > done) {
+                last = std::max(last, t);
+            }
+        };
+        for (u64 word = first_page >> 6; word <= last_page >> 6; ++word) {
+            check(chunks[word >> 6], word & 63);
+            const Entry& entry = words[word];
+            // Most words were last touched by work done already.
+            if ((only_written ? entry.last_written : entry.last_touched) <= done) {
+                continue;
+            }
+            const u64 lo = word == first_page >> 6 ? first_page & 63 : 0;
+            const u64 hi = word == last_page >> 6 ? last_page & 63 : 63;
+            for (u64 index = lo; index <= hi; ++index) {
+                check(entry, index);
+            }
+        }
+        return last;
+    }
+
+private:
+    /// The last ticks that touched and wrote each of 64 pages, or words for a chunk, and all of
+    /// them.
+    struct Entry {
+        std::array<u32, 64> touched{};
+        std::array<u32, 64> written{};
+        u32 last_touched{};
+        u32 last_written{};
+    };
+
+    static void Mark(Entry& entry, u64 index, u32 tick, bool written) {
+        entry.touched[index] = std::max(entry.touched[index], tick);
+        entry.last_touched = std::max(entry.last_touched, tick);
+        if (written) {
+            entry.written[index] = std::max(entry.written[index], tick);
+            entry.last_written = std::max(entry.last_written, tick);
+        }
+    }
+
+    std::vector<Entry> words;
+    std::vector<Entry> chunks;
+};
 /// What the GPU read and wrote of a buffer since the last barrier, and what it touched in any way
-/// in the command buffer being recorded.
+/// in the command buffer being recorded. Reads are only looked through for writes, which are far
+/// fewer, so more of them are kept to the byte.
 struct BufferAccesses {
     AccessTracker reads;
     AccessTracker writes;
-    AccessTracker session;
+    ExactRanges<256> exact_reads;
+    ExactRanges<64> exact_writes;
+    SessionPages session;
+    /// What the graphics queue's work not done yet touches, when compute rings run on a second
+    /// queue.
+    InFlightPages graphics_in_flight;
 };
 
 } // namespace VideoCore

@@ -96,6 +96,39 @@ static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsO
     return num_outputs;
 }
 
+template <typename ProgramRegs>
+Shader::ShaderParams PipelineCache::ProgramParams(const ProgramRegs& pgm) {
+    const u32* code = pgm.template Address<u32*>();
+    // Programs are placed at large alignments, so their addresses only differ in high bits.
+    auto& hint = binary_info_hints[(reinterpret_cast<uintptr_t>(code) * 0x9E3779B97F4A7C15ULL) >>
+                                   (64 - std::countr_zero(binary_info_hints.size()))];
+    // Read since the game last could have changed it, see Liverpool::sync_count.
+    if (hint.code != code || hint.sync_count != liverpool->sync_count) {
+        const AmdGpu::BinaryInfo* bininfo = nullptr;
+        if (hint.code == code) {
+            const auto* hinted = std::bit_cast<const AmdGpu::BinaryInfo*>(code + hint.offset);
+            if (hinted->Valid()) {
+                bininfo = hinted;
+            }
+        }
+        if (!bininfo) {
+            bininfo = &AmdGpu::SearchBinaryInfo(code);
+        }
+        hint = {
+            .code = code,
+            .offset = static_cast<u32>(reinterpret_cast<const u32*>(bininfo) - code),
+            .length = bininfo->length,
+            .hash = bininfo->shader_hash,
+            .sync_count = liverpool->sync_count,
+        };
+    }
+    return {
+        .user_data = pgm.user_data,
+        .code = std::span{code, hint.length / sizeof(u32)},
+        .hash = hint.hash,
+    };
+}
+
 const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStage l_stage) {
     auto& info = runtime_infos[u32(l_stage)];
     const auto& regs = liverpool->regs;
@@ -684,7 +717,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
-        const auto params = AmdGpu::GetParams(*pgm);
+        const auto params = ProgramParams(*pgm);
         std::tie(infos[stage_out_idx], modules[stage_out_idx], key.stage_hashes[stage_out_idx]) =
             GetProgram(stage_in, stage_out, params, binding);
         return true;
@@ -784,7 +817,7 @@ bool PipelineCache::RefreshGraphicsStages() {
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
-    const auto cs_params = AmdGpu::GetParams(cs_pgm);
+    const auto cs_params = ProgramParams(cs_pgm);
     std::tie(infos[0], modules[0], compute_key.value) =
         GetProgram(HwStage::Compute, SwStage::Compute, cs_params, binding);
     return true;
@@ -848,32 +881,50 @@ vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::Runtim
 PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_stage,
                                                 const Shader::ShaderParams& params,
                                                 Shader::Backend::Bindings& binding) {
-    auto runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
-    auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
-    if (new_program) {
-        it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
-        auto& program = it_pgm.value();
-        auto start = binding;
-        const auto lookup_runtime_info = runtime_info;
-        const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
-        auto spec = Shader::StageSpecialization(program->info, lookup_runtime_info, profile, start);
-        const auto perm_hash = HashCombine(params.hash, 0);
+    // Looked at for every stage of every draw, and only copied to compile with, as compiling can
+    // change it.
+    const Shader::RuntimeInfo& built_runtime_info = BuildRuntimeInfo(hw_stage, sw_stage);
+    // Draws mostly run the program the draw before did in the stage, found here without a lookup
+    // in the map of them all, which missed the cache on most draws. Programs are never removed.
+    auto& last_program = last_programs[static_cast<u32>(hw_stage)];
+    if (last_program.second == nullptr || last_program.first != params.hash) {
+        auto [it_pgm, new_program] = program_cache.try_emplace(params.hash);
+        if (new_program) {
+            auto runtime_info = built_runtime_info;
+            it_pgm.value() = std::make_unique<Program>(hw_stage, sw_stage, params);
+            auto& program = it_pgm.value();
+            auto start = binding;
+            // Ours: compiling can change runtime_info/binding, so specialize from the
+            // pre-compile copy.
+            const auto lookup_runtime_info = runtime_info;
+            const auto module = CompileModule(program->info, runtime_info, params.code, 0, binding);
+            auto spec =
+                Shader::StageSpecialization(program->info, lookup_runtime_info, profile, start);
+            const auto perm_hash = HashCombine(params.hash, 0);
 
-        RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
-        program->AddPermut(module, std::move(spec));
-        if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
-            fetch_shader = &fetch;
+            RegisterShaderMeta(program->info, spec.fetch_shader_data, spec, perm_hash, 0);
+            program->AddPermut(module, std::move(spec));
+            if (auto& fetch = program->modules[0].spec.fetch_shader_data; !fetch.Empty()) {
+                fetch_shader = &fetch;
+            }
+            // Ours: populate the lookup cache for the new program right away, adapted to
+            // the 16-slot system (LookupSlot/slot_used), so the next draw hits without
+            // building a specialization.
+            program->FindSharpDwords();
+            const auto* new_lookup_dwords = program->LookupDwords();
+            const size_t new_slot = program->LookupSlot(program->info, start);
+            program->last_lookups[new_slot].Remember(
+                program->info, lookup_runtime_info, start, 0,
+                program->modules[0].spec.fetch_shader_data, new_lookup_dwords);
+            program->slot_used[new_slot] = ++program->lookup_clock;
+            program->last_hit_slot = new_slot;
+            last_program = {params.hash, program.get()};
+            return std::make_tuple(&program->info, module, perm_hash);
         }
-        program->FindSharpDwords();
-        const auto* lookup_dwords = program->LookupDwords();
-        auto& last = program->last_lookups[program->next_last_lookup];
-        program->next_last_lookup = (program->next_last_lookup + 1) % Program::NumLastLookups;
-        last.Remember(program->info, lookup_runtime_info, start, 0,
-                      program->modules[0].spec.fetch_shader_data, lookup_dwords);
-        return std::make_tuple(&program->info, module, perm_hash);
+        last_program = {params.hash, it_pgm.value().get()};
     }
 
-    auto& program = it_pgm.value();
+    Program* const program = last_program.second;
     auto& info = program->info;
     info.pgm_base = params.Base(); // Needs to be actualized for inline cbuffer address fixup
     info.user_data = params.user_data;
@@ -884,27 +935,47 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
         program->FindSharpDwords();
     }
     const auto* lookup_dwords = program->LookupDwords();
-    // Newest first, as the lookups made last are the likeliest to come again.
-    for (size_t i = 1; i <= Program::NumLastLookups; ++i) {
-        const auto& last =
-            program->last_lookups[(program->next_last_lookup + Program::NumLastLookups - i) %
-                                  Program::NumLastLookups];
+    const u64 now = ++program->lookup_clock;
+    const auto try_slot = [&](size_t slot) {
+        const auto& last = program->last_lookups[slot];
         if (!last.valid || last.perm_idx >= program->modules.size()) {
-            continue;
+            return false;
         }
-        auto& last_module = program->modules[last.perm_idx];
-        if (last.Matches(info, runtime_info, binding, last_module.spec.fetch_shader_data,
-                         lookup_dwords)) {
-            Common::Perf::Count(Common::Perf::Counter::ShaderLookupsRemembered);
-            info.AddBindings(binding);
-            if (auto& fetch = last_module.spec.fetch_shader_data; !fetch.Empty()) {
-                fetch_shader = &fetch;
+        if (!last.Matches(info, built_runtime_info, binding,
+                          program->modules[last.perm_idx].spec.fetch_shader_data, lookup_dwords)) {
+            return false;
+        }
+        program->last_hit_slot = slot;
+        program->slot_used[slot] = now;
+        return true;
+    };
+    // Draws mostly look up what the draw before did, without hashing anything.
+    size_t hit_slot = program->last_hit_slot;
+    bool hit = try_slot(hit_slot);
+    const size_t first_slot = hit ? 0 : program->LookupSlot(info, binding);
+    const size_t second_slot = (first_slot + 1) % Program::NumLookupSlots;
+    if (!hit) {
+        for (const size_t slot : {first_slot, second_slot}) {
+            if (slot != hit_slot && try_slot(slot)) {
+                hit = true;
+                hit_slot = slot;
+                break;
             }
-            return std::make_tuple(&program->info, last_module.module,
-                                   HashCombine(params.hash, last.perm_idx));
         }
     }
+    if (hit) {
+        const auto& last = program->last_lookups[hit_slot];
+        auto& last_module = program->modules[last.perm_idx];
+        Common::Perf::Count(Common::Perf::Counter::ShaderLookupsRemembered);
+        info.AddBindings(binding);
+        if (auto& fetch = last_module.spec.fetch_shader_data; !fetch.Empty()) {
+            fetch_shader = &fetch;
+        }
+        return std::make_tuple(&program->info, last_module.module,
+                               HashCombine(params.hash, last.perm_idx));
+    }
 
+    auto runtime_info = built_runtime_info;
     const auto start = binding;
     auto spec = Shader::StageSpecialization(info, runtime_info, profile, binding);
 
@@ -930,11 +1001,15 @@ PipelineCache::Result PipelineCache::GetProgram(HwStage hw_stage, SwStage sw_sta
     if (auto& fetch = program->modules[perm_idx].spec.fetch_shader_data; !fetch.Empty()) {
         fetch_shader = &fetch;
     }
-    // The oldest lookup makes way, as the ones made since are more likely to come again.
-    auto& last = program->last_lookups[program->next_last_lookup];
-    program->next_last_lookup = (program->next_last_lookup + 1) % Program::NumLastLookups;
-    last.Remember(info, runtime_info, start, perm_idx,
-                  program->modules[perm_idx].spec.fetch_shader_data, lookup_dwords);
+    // The one of the two slots used less lately makes way.
+    const size_t slot = program->slot_used[first_slot] <= program->slot_used[second_slot]
+                            ? first_slot
+                            : second_slot;
+    program->last_lookups[slot].Remember(info, runtime_info, start, perm_idx,
+                                         program->modules[perm_idx].spec.fetch_shader_data,
+                                         lookup_dwords);
+    program->slot_used[slot] = now;
+    program->last_hit_slot = slot;
     return std::make_tuple(&program->info, module, perm_hash);
 }
 
@@ -1065,6 +1140,31 @@ void Program::FindSharpDwords() {
     }
 }
 
+size_t Program::LookupSlot(const Shader::Info& info, const Shader::Backend::Bindings& start) const {
+    // From what LastLookup::Matches compares first, and the same for the inputs it finds the
+    // same: only the bits of sharp dwords that count, and where bindings start only for programs
+    // binding resources.
+    u64 hash = 0;
+    const auto mix = [&hash](u64 value) {
+        hash = (hash ^ value) * 0x9E3779B97F4A7C15ULL;
+        hash ^= hash >> 29;
+    };
+    if (!info.buffers.empty() || !info.images.empty() || !info.samplers.empty()) {
+        mix(u64{start.unified} << 32 | start.buffer);
+    }
+    if (const auto* dwords = LookupDwords()) {
+        for (const SharpDword& dword : *dwords) {
+            const u32 value = info.flattened_ud_buf[dword.index];
+            mix(u64{value & dword.mask} << 1 | u64{dword.nonzero && value != 0});
+        }
+    } else {
+        for (const u32 value : info.flattened_ud_buf) {
+            mix(value);
+        }
+    }
+    return static_cast<size_t>(hash >> 32) % NumLookupSlots;
+}
+
 bool Program::LastLookup::Matches(const Shader::Info& info,
                                   const Shader::RuntimeInfo& runtime_info_,
                                   const Shader::Backend::Bindings& start_,
@@ -1074,9 +1174,14 @@ bool Program::LastLookup::Matches(const Shader::Info& info,
     // would come out the same and match the same permutation. Like specializations, programs
     // binding no resources don't compare where their bindings start, which depends on the
     // stages they are drawn with.
+    //
+    // Where the program is isn't compared. It only offsets the address of constant buffers
+    // inlined in its code, which specializations don't look at. inFAMOUS Second Son has copies
+    // of some programs at hundreds of addresses, and comparing it made three quarters of the
+    // lookups that missed.
     const bool binds_resources =
         !info.buffers.empty() || !info.images.empty() || !info.samplers.empty();
-    if (pgm_base != info.pgm_base || (binds_resources && start != start_)) {
+    if (binds_resources && start != start_) {
         return false;
     }
     if (sharp_dwords) {
@@ -1125,7 +1230,6 @@ void Program::LastLookup::Remember(const Shader::Info& info,
         return;
     }
     perm_idx = perm_idx_;
-    pgm_base = info.pgm_base;
     start = start_;
     runtime_info = runtime_info_;
     if (sharp_dwords) {

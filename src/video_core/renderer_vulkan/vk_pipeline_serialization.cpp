@@ -4,6 +4,7 @@
 #include <string_view>
 
 #include "common/serdes.h"
+#include "core/emulator_settings.h"
 #include "shader_recompiler/frontend/fetch_shader.h"
 #include "shader_recompiler/info.h"
 #include "video_core/cache_storage.h"
@@ -26,7 +27,11 @@ namespace {
 // and is changed to the next such build whenever it changes again. Keying the cache to every
 // build dropped it with each update, and some games compile hundreds of compute shaders while
 // they are played, at up to a few hundred milliseconds each.
-constexpr std::string_view ShaderCacheRevision = "infamous-fixbuild-anyps5-v1";
+// Union of both lineages: ours (infamous-fixbuild-anyps5-v1, persistent driver cache build)
+// and theirs (386defd5, binary-info/descriptor changes). Any new string drops caches from
+// both parents, which is what each side intended by bumping the revision.
+constexpr std::string_view ShaderCacheRevision =
+    "infamous-fixbuild-anyps5-v1-386defd5d40fc5826e9a642707143a1257e09940";
 } // Anonymous namespace
 
 void RegisterPipelineData(const ComputePipelineKey& key,
@@ -272,6 +277,17 @@ bool PipelineCache::LoadPipelineStage(Serialization::Archive& ar, size_t stage) 
                                        spv);
     if (spv.empty()) {
         return false;
+    }
+
+    // A patch in the shader patch folder replaces the shader the cache holds, as it does when the
+    // shader is compiled. Without this, patched shaders were only used while the cache was empty.
+    if (EmulatorSettings.IsPatchShaders()) {
+        if (auto patch =
+                GetShaderPatch(program->info.pgm_hash, program->info.hw_stage, perm_idx, "spv")) {
+            LOG_INFO(Loader, "Loaded patch for cached {} shader {:#x}", program->info.hw_stage,
+                     program->info.pgm_hash);
+            spv = std::move(*patch);
+        }
     }
 
     // Permutation hash depends on shader variation index. To prevent collisions, we need insert it

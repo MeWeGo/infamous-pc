@@ -67,6 +67,16 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
     critical_gc_memory = static_cast<u64>(
         std::max<s64>(std::min(device_local_memory - min_vacancy_critical, min_spacing_critical),
                       min_critical_floor));
+    // Buffer memory comes in large ranges that the collector, which runs once per submit and
+    // only frees old images, can't make room for in time. On small cards, start collecting
+    // earlier so a gigabyte of headroom is left.
+    if (device_local_memory <= static_cast<s64>(SMALL_CARD_MEMORY)) {
+        const s64 headroom_critical =
+            std::max<s64>(device_local_memory - static_cast<s64>(RESIDENCY_HEADROOM),
+                          min_critical_floor);
+        critical_gc_memory = std::min(critical_gc_memory, static_cast<u64>(headroom_critical));
+        pressure_gc_memory = std::min(pressure_gc_memory, critical_gc_memory);
+    }
     trigger_gc_memory = static_cast<u64>((device_local_memory - mem_threshold) / 2);
     // On cards with plenty of memory, leave the cache alone until it fills a good part of it.
     // Collecting from a few GB on dropped textures the game went on to use again a moment
@@ -638,8 +648,13 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
 }
 
 ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
+    return FindTexture(image_id, desc.type, desc.view_info);
+}
+
+ImageView& TextureCache::FindTexture(ImageId image_id, BindingType type,
+                                     const ImageViewInfo& view_info) {
     Image& image = slot_images[image_id];
-    if (desc.type == BindingType::Storage) {
+    if (type == BindingType::Storage) {
         image.flags |= ImageFlagBits::GpuModified;
         if (readback_linear_images && (!image.info.props.is_tiled || image.info.size.width <= 8) &&
             image.info.guest_address != 0) {
@@ -648,7 +663,7 @@ ImageView& TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
         }
     }
     UpdateImage(image_id);
-    return image.FindView(desc.view_info);
+    return image.FindView(view_info);
 }
 
 ImageView& TextureCache::FindRenderTarget(ImageId image_id, const ImageDesc& desc) {
@@ -813,21 +828,16 @@ vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,
 }
 
 u64 TextureCache::HashBindingKey(std::span<const u32> key) {
-    u64 hash = key.size();
-    for (const u32 dword : key) {
-        hash = (hash ^ dword) * 0x9E3779B97F4A7C15ULL;
-        hash ^= hash >> 32;
-    }
-    return hash;
+    // Hashing a dword at a time, each step waiting for the one before, took over 1% of the GPU
+    // thread: keys are a dozen dwords, and every texture of every draw is looked up by one.
+    return XXH3_64bits(key.data(), key.size_bytes());
 }
 
-bool TextureCache::UseBindingLookup(BindingLookup& lookup, std::span<const u32> key,
-                                    ImageDesc& desc) {
+bool TextureCache::UseBindingLookup(BindingLookup& lookup, std::span<const u32> key) {
     if (lookup.generation != image_generation || lookup.key_size != key.size() ||
         !std::equal(key.begin(), key.end(), lookup.key.begin())) {
         return false;
     }
-    desc = lookup.desc;
     // FindImage marks the image it finds as used.
     Image& image = slot_images[lookup.image_id];
     image.tick_accessed_last = scheduler.CurrentTick();
@@ -1117,6 +1127,29 @@ void TextureCache::RunGarbageCollector() {
     GarbageCollectImages();
     GarbageCollectSamplers();
     ++gc_tick;
+}
+
+bool TextureCache::ReleaseMemoryForAllocation() {
+    // Only images unused for as long as the collector's gentlest pass waits go, so the ones the
+    // guest is still drawing with stay.
+    const u64 ticks_to_destroy = std::min<u64>(16, gc_tick);
+    size_t num_freed = 0;
+    image_lru_cache.ForEachItemBelow(gc_tick - ticks_to_destroy, [&](Image& image) {
+        const bool download = image.SafeToDownload();
+        if (image.info.IsTiled() && download) {
+            // Can't handle non-linear image downloads, same as the collector.
+            return false;
+        }
+        const auto image_id = slot_images.GetSlotId(image);
+        if (download) {
+            DownloadImageMemory(image_id);
+        }
+        FreeImage(image_id);
+        ++num_freed;
+        return false;
+    });
+    LOG_INFO(Render_Vulkan, "Texture cache: freed {} images for an allocation", num_freed);
+    return num_freed != 0;
 }
 
 void TextureCache::DeleteImage(ImageId image_id) {
