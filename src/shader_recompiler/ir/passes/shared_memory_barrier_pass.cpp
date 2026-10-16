@@ -83,29 +83,16 @@ static void EmitBarrierAtBlockStart(IR::Block* block, bool use_subgroup_barrier)
 }
 
 static bool SearchDivergence(const IR::Value& root, const NodeSet& uniform_read_lanes) {
-    // BreadthFirstSearch visits each instruction once across all operand paths. A ReadFirstLane
-    // or a uniform-block ReadLane with immediate lane index produces a wave-uniform value (after
-    // LowerWave64BallotPass lowers the uniform ReadLane to a cross-half broadcast), so we return
-    // false to prune its value operand instead of traversing into a lane-varying source.
-    return IR::BreadthFirstSearch(root, [&](IR::Inst* inst) -> std::optional<bool> {
-               if (inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
-                   return false;
-               }
-               if (inst->GetOpcode() == IR::Opcode::ReadLane && inst->Arg(1).IsImmediate() &&
-                   uniform_read_lanes.contains(inst->GetParent())) {
-                   return false;
-               }
-               if (IsLaneVaryingSource(*inst)) {
-                   return true;
-               }
-               if (IsLoadShared(*inst)) {
-                   // Treat shared memory loads as potentially lane-varying if their offset depends
-                   // on lane ID; the BFS will naturally traverse into inst->Arg(0) (the offset)
-                   // when we return nullopt here.
-                   return std::nullopt;
-               }
-               return std::nullopt;
-           }) == true;
+    // ReadFirstLane and an immediate-index ReadLane in a uniform block are lowered by
+    // LowerWave64BallotPass to wave-wide broadcasts, so they are uniform boundaries. In other
+    // blocks they are only host-subgroup uniform and must not hide lane-varying operands.
+    // Shared memory loads are traversed through their offset operand like any other instruction.
+    return ReachesLaneVaryingSource(root, [&](const IR::Inst& inst) {
+        const bool is_read_lane =
+            inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate();
+        const bool is_read_first = inst.GetOpcode() == IR::Opcode::ReadFirstLane;
+        return (is_read_lane || is_read_first) && uniform_read_lanes.contains(inst.GetParent());
+    });
 }
 
 static bool IsDivergent(const IR::U1& cond, const NodeSet& uniform_blocks) {

@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <functional>
 #include "shader_recompiler/ir/basic_block.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -43,6 +44,11 @@ void SharedMemorySimplifyPass(IR::Program& program, const Profile& profile);
 void SharedMemoryToStoragePass(IR::Program& program, const RuntimeInfo& runtime_info,
                                const Profile& profile);
 bool IsLaneVaryingSource(const IR::Inst& inst);
+// Returns true if any lane-varying source is reachable from root. Instructions for which
+// is_uniform_leaf returns true are treated as wave-uniform boundaries: their operands are not
+// visited. Unlike IR::BreadthFirstSearch this is exhaustive and independent of operand order.
+bool ReachesLaneVaryingSource(const IR::Value& root,
+                              const std::function<bool(const IR::Inst&)>& is_uniform_leaf);
 std::vector<IR::Block*> FindWave64UniformBlocks(const IR::Program& program);
 
 } // namespace Shader::Optimization

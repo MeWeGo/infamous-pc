@@ -159,8 +159,12 @@ set(GCN_TEST_SOURCES
     gcn/translator.hpp
     gcn/translator.cpp
 
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/lower_wave64_pass.cpp
+    ${CMAKE_SOURCE_DIR}/src/shader_recompiler/ir/passes/shared_memory_barrier_pass.cpp
+
     # Tests
     gcn/test_gcn_instructions.cpp
+    gcn/test_wave64_pass.cpp
 )
 
 add_executable(shadps4_settings_test ${SETTINGS_TEST_SOURCES})

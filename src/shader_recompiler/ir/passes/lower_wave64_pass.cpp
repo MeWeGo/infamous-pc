@@ -38,31 +38,43 @@ bool IsLaneVaryingSource(const IR::Inst& inst) {
     }
 }
 
+bool ReachesLaneVaryingSource(const IR::Value& root,
+                              const std::function<bool(const IR::Inst&)>& is_uniform_leaf) {
+    if (root.IsImmediate()) {
+        return false;
+    }
+    std::unordered_set<const IR::Inst*> visited;
+    std::vector<const IR::Inst*> stack{root.Inst()};
+    while (!stack.empty()) {
+        const IR::Inst* const inst = stack.back();
+        stack.pop_back();
+        if (!visited.insert(inst).second) {
+            continue;
+        }
+        if (is_uniform_leaf(*inst)) {
+            continue;
+        }
+        if (IsLaneVaryingSource(*inst)) {
+            return true;
+        }
+        for (size_t i = 0; i < inst->NumArgs(); ++i) {
+            const IR::Value arg = inst->Arg(i);
+            if (!arg.IsImmediate()) {
+                stack.push_back(arg.Inst());
+            }
+        }
+    }
+    return false;
+}
+
 static bool IsProvablyWaveUniform(const IR::Value& root) {
     if (root.IsImmediate()) {
         return true;
     }
-    // Note: BreadthFirstSearch visits each instruction at most once across all operand paths.
-    // A ReadFirstLane/ReadLane leaf returns true (pruning its value arg, which may be
-    // lane-varying), while a non-terminal node returns nullopt so the search continues into
-    // its operands.
-    return !IR::BreadthFirstSearch(root.Inst(), [](const IR::Inst* inst) -> std::optional<bool> {
-                switch (inst->GetOpcode()) {
-                case IR::Opcode::ReadFirstLane:
-                    return true;
-                case IR::Opcode::ReadLane:
-                    if (inst->Arg(1).IsImmediate()) {
-                        return true;
-                    }
-                    break;
-                default:
-                    if (IsLaneVaryingSource(*inst)) {
-                        return false;
-                    }
-                    break;
-                }
-                return std::nullopt;
-            }).value_or(true);
+    return !ReachesLaneVaryingSource(root, [](const IR::Inst& inst) {
+        return inst.GetOpcode() == IR::Opcode::ReadFirstLane ||
+               (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate());
+    });
 }
 
 static bool IsDivergentCondition(const IR::U1& condition) {
