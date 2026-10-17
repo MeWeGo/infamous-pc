@@ -4,8 +4,10 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <string>
 #include <utility>
 #include <boost/container/small_vector.hpp>
+#include <fmt/format.h>
 #include "common/adaptive_mutex.h"
 #include "common/assert.h"
 #include "common/debug.h"
@@ -533,6 +535,111 @@ public:
 };
 #endif // __linux__
 
+namespace {
+
+constexpr size_t FaultRipSlots = 4096;
+struct FaultRipSlot {
+    std::atomic<u64> rip{0};
+    std::atomic<u64> count{0};
+};
+static std::array<FaultRipSlot, FaultRipSlots> s_fault_rip_table{};
+static std::atomic<u64> s_total_read_faults{0};
+
+static void ReportFaultRips(u64 total, bool is_shutdown) noexcept {
+    struct TopEntry {
+        u64 rip{0};
+        u64 count{0};
+    };
+    std::array<TopEntry, 10> top{};
+    size_t top_len = 0;
+    size_t unique_count = 0;
+
+    for (const auto& slot : s_fault_rip_table) {
+        const u64 r = slot.rip.load(std::memory_order_relaxed);
+        const u64 c = slot.count.load(std::memory_order_relaxed);
+        if (r == 0 || c == 0) {
+            continue;
+        }
+        ++unique_count;
+
+        size_t pos = top_len < top.size() ? top_len : top.size();
+        for (size_t i = 0; i < top_len; ++i) {
+            if (c > top[i].count) {
+                pos = i;
+                break;
+            }
+        }
+        if (pos < top.size()) {
+            if (top_len < top.size()) {
+                ++top_len;
+            }
+            for (size_t i = top_len - 1; i > pos; --i) {
+                top[i] = top[i - 1];
+            }
+            top[pos] = {r, c};
+        }
+    }
+
+    if (top_len == 0) {
+        return;
+    }
+
+    std::string top_str;
+    for (size_t i = 0; i < top_len; ++i) {
+        const double pct = total > 0 ? (100.0 * top[i].count / total) : 0.0;
+        top_str += fmt::format(" [#{}: rip={:#x} ({}x, {:.1f}%)]", i + 1, top[i].rip,
+                               top[i].count, pct);
+    }
+
+    LOG_INFO(Render,
+             "Read-fault RIP telemetry{}: {} total faults across {} unique RIPs; top {}:{}",
+             is_shutdown ? " (shutdown)" : "", total, unique_count, top_len, top_str);
+}
+
+static void RecordReadFaultRip(uintptr_t rip_raw) noexcept {
+    const u64 rip = static_cast<u64>(rip_raw);
+    if (rip == 0) {
+        return;
+    }
+
+    u64 h = rip;
+    h ^= h >> 33;
+    h *= 0xff51afd7ed558ccdULL;
+    h ^= h >> 33;
+    h *= 0xc4ceb9fe1a85ec53ULL;
+    h ^= h >> 33;
+
+    constexpr size_t Mask = FaultRipSlots - 1;
+    const size_t start_idx = static_cast<size_t>(h) & Mask;
+    for (size_t i = 0; i < FaultRipSlots; ++i) {
+        auto& slot = s_fault_rip_table[(start_idx + i) & Mask];
+        const u64 existing = slot.rip.load(std::memory_order_relaxed);
+        if (existing == rip) {
+            slot.count.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+        if (existing == 0) {
+            u64 expected = 0;
+            if (slot.rip.compare_exchange_strong(expected, rip, std::memory_order_relaxed)) {
+                slot.count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+            if (expected == rip) {
+                slot.count.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
+        }
+    }
+
+    const u64 total = s_total_read_faults.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (total == 1 || total == 100 || (total % 1000 == 0 && total <= 5000) ||
+        (total % 5000 == 0)) {
+        ReportFaultRips(total, false);
+    }
+}
+
+} // namespace
+
 struct SignalImpl : public PageManager::Impl {
     SignalImpl(Vulkan::Rasterizer* rasterizer_) : Impl() {
         rasterizer = rasterizer_;
@@ -541,6 +648,10 @@ struct SignalImpl : public PageManager::Impl {
         constexpr auto priority = std::numeric_limits<u32>::min();
         Core::Signals::Instance()->RegisterAccessViolationHandler(GuestFaultSignalHandler,
                                                                   priority);
+    }
+
+    ~SignalImpl() override {
+        ReportFaultRips(s_total_read_faults.load(std::memory_order_relaxed), true);
     }
 
     void Protect(VAddr address, size_t size, Core::MemoryPermission perms) override {
@@ -584,6 +695,7 @@ struct SignalImpl : public PageManager::Impl {
             }
             if (!is_gpu_thread) {
                 Common::Perf::Count(Common::Perf::Counter::ReadFaults);
+                RecordReadFaultRip(reinterpret_cast<uintptr_t>(Common::GetRip(context)));
             }
             return true;
         }
