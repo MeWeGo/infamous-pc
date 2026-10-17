@@ -255,10 +255,17 @@ private:
     Pipeline::DescriptorWrites set_writes;
     Shader::PushData push_data;
 
-    /// The vertex input last set in the command buffer, valid unless the dynamic state of the
-    /// scheduler says it is dirty.
+    /// The vertex input and vertex/index buffers last set in the command buffer, valid unless the
+    /// dynamic state of the scheduler says they are dirty.
     VertexInputs<vk::VertexInputAttributeDescription2EXT> last_vertex_attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> last_vertex_bindings;
+    VertexInputs<vk::Buffer> last_host_vertex_buffers;
+    VertexInputs<vk::DeviceSize> last_host_vertex_offsets;
+    VertexInputs<vk::DeviceSize> last_host_vertex_sizes;
+    VertexInputs<vk::DeviceSize> last_host_vertex_strides;
+    vk::Buffer last_index_buffer{};
+    u64 last_index_offset{};
+    vk::IndexType last_index_type{};
 
     /// Everything the dynamic state of a draw is built from besides the registers covered by
     /// their version, as of the last draw that built it.

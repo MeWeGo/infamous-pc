@@ -99,7 +99,7 @@ void EmulatorSettingsImpl::PrintChangedSummary(const std::vector<std::string>& c
 
 bool EmulatorSettingsImpl::MigrateSettings() {
     // Bump this and add a step below whenever existing configs should pick up a new default.
-    constexpr int LatestMigration = 2;
+    constexpr int LatestMigration = 3;
 
     auto& migration = m_debug.config_migration.value;
     if (migration >= LatestMigration) {
@@ -113,6 +113,9 @@ bool EmulatorSettingsImpl::MigrateSettings() {
     if (migration < 2) {
         m_gpu.readbacks_mode.value = GpuReadbacksMode::Precise;
         m_gpu.direct_memory_access_enabled.value = true;
+    }
+    if (migration < 3) {
+        m_general.redzone_patches.value = true;
     }
     migration = LatestMigration;
     return true;

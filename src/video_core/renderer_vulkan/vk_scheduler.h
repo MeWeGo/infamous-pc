@@ -151,6 +151,8 @@ struct DynamicState {
         bool feedback_loop_enabled : 1;
         /// Set by the rasterizer, which keeps the vertex input it last set.
         bool vertex_input : 1;
+        bool vertex_buffers : 1;
+        bool index_buffer : 1;
         bool graphics_pipeline : 1;
         bool compute_pipeline : 1;
         bool graphics_push_constants : 1;

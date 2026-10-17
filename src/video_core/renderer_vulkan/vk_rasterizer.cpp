@@ -1111,13 +1111,30 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
         host_strides.push_back(buffer.GetStride());
     }
 
-    const auto cmdbuf = scheduler.CommandBuffer();
+    auto& dirty = scheduler.GetDynamicState().dirty_state;
     const auto num_buffers = guest_buffers.size();
     if (instance.IsVertexInputDynamicState()) {
-        cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+        if (dirty.vertex_buffers || host_buffers != last_host_vertex_buffers ||
+            host_offsets != last_host_vertex_offsets) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.bindVertexBuffers(0, num_buffers, host_buffers.data(), host_offsets.data());
+            last_host_vertex_buffers = host_buffers;
+            last_host_vertex_offsets = host_offsets;
+            dirty.vertex_buffers = false;
+        }
     } else {
-        cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
-                                  host_sizes.data(), host_strides.data());
+        if (dirty.vertex_buffers || host_buffers != last_host_vertex_buffers ||
+            host_offsets != last_host_vertex_offsets || host_sizes != last_host_vertex_sizes ||
+            host_strides != last_host_vertex_strides) {
+            const auto cmdbuf = scheduler.CommandBuffer();
+            cmdbuf.bindVertexBuffers2(0, num_buffers, host_buffers.data(), host_offsets.data(),
+                                      host_sizes.data(), host_strides.data());
+            last_host_vertex_buffers = host_buffers;
+            last_host_vertex_offsets = host_offsets;
+            last_host_vertex_sizes = host_sizes;
+            last_host_vertex_strides = host_strides;
+            dirty.vertex_buffers = false;
+        }
     }
 }
 
@@ -1142,8 +1159,17 @@ void Rasterizer::BindIndexBuffer(u32 index_offset) {
     if (index_buffer_size != 0) {
         bound_buffers.emplace_back(buffer, offset, index_buffer_size, false);
     }
-    const auto cmdbuf = scheduler.CommandBuffer();
-    cmdbuf.bindIndexBuffer(buffer->Handle(), offset, index_type);
+    auto& dirty = scheduler.GetDynamicState().dirty_state;
+    const vk::Buffer handle = buffer->Handle();
+    if (dirty.index_buffer || handle != last_index_buffer || offset != last_index_offset ||
+        index_type != last_index_type) {
+        const auto cmdbuf = scheduler.CommandBuffer();
+        cmdbuf.bindIndexBuffer(handle, offset, index_type);
+        last_index_buffer = handle;
+        last_index_offset = offset;
+        last_index_type = index_type;
+        dirty.index_buffer = false;
+    }
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {

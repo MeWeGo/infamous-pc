@@ -204,7 +204,7 @@ struct GeneralSettings {
     Setting<std::string> shadnet_webapi_server{"http://srv.shadps4.net:31315"};
     Setting<std::string> signaling_info{};
     Setting<bool> enable_upnp{true};
-    Setting<bool> redzone_patches{false};
+    Setting<bool> redzone_patches{true};
 
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {

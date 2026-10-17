@@ -219,6 +219,7 @@ TEST_F(EmulatorSettingsTest, SetDefaultValuesResetsAllGroupsToFactory) {
     temp_settings->SetReadbacksMode(GpuReadbacksMode::Disabled);
     temp_settings->SetDirectMemoryAccessEnabled(false);
     temp_settings->SetPipelineCacheEnabled(false);
+    temp_settings->SetRedZonePatchingEnabled(false);
 
     temp_settings->SetDefaultValues(); // reset to defaults
     // check if values are reset to defaults
@@ -230,6 +231,7 @@ TEST_F(EmulatorSettingsTest, SetDefaultValuesResetsAllGroupsToFactory) {
     EXPECT_EQ(temp_settings->GetReadbacksMode(), GpuReadbacksMode::Precise);
     EXPECT_TRUE(temp_settings->IsDirectMemoryAccessEnabled());
     EXPECT_TRUE(temp_settings->IsPipelineCacheEnabled());
+    EXPECT_TRUE(temp_settings->IsRedZonePatchingEnabled());
 }
 
 TEST_F(EmulatorSettingsTest, SetDefaultValuesClearsGameSpecificOverrides) {
@@ -745,6 +747,7 @@ TEST_F(EmulatorSettingsTest, MigrationEnablesPipelineCacheInOldConfig) {
     j["Vulkan"]["pipeline_cache_enabled"] = false;
     j["GPU"]["readbacks_mode"] = GpuReadbacksMode::Disabled;
     j["GPU"]["direct_memory_access_enabled"] = false;
+    j["General"]["redzone_patches"] = false;
     j["Debug"].erase("config_migration");
     WriteJson(ConfigJson(), j);
 
@@ -755,9 +758,11 @@ TEST_F(EmulatorSettingsTest, MigrationEnablesPipelineCacheInOldConfig) {
     EXPECT_TRUE(f->IsPipelineCacheEnabled());
     EXPECT_EQ(f->GetReadbacksMode(), GpuReadbacksMode::Precise);
     EXPECT_TRUE(f->IsDirectMemoryAccessEnabled());
+    EXPECT_TRUE(f->IsRedZonePatchingEnabled());
     EXPECT_TRUE(ReadJson(ConfigJson())["Vulkan"]["pipeline_cache_enabled"].get<bool>());
     EXPECT_EQ(ReadJson(ConfigJson())["GPU"]["readbacks_mode"].get<u32>(), GpuReadbacksMode::Precise);
     EXPECT_TRUE(ReadJson(ConfigJson())["GPU"]["direct_memory_access_enabled"].get<bool>());
+    EXPECT_TRUE(ReadJson(ConfigJson())["General"]["redzone_patches"].get<bool>());
 }
 
 TEST_F(EmulatorSettingsTest, MigrationKeepsLaterUserChoice) {
@@ -765,6 +770,7 @@ TEST_F(EmulatorSettingsTest, MigrationKeepsLaterUserChoice) {
     temp_settings->SetPipelineCacheEnabled(false);
     temp_settings->SetReadbacksMode(GpuReadbacksMode::Disabled);
     temp_settings->SetDirectMemoryAccessEnabled(false);
+    temp_settings->SetRedZonePatchingEnabled(false);
     temp_settings->Save();
 
     auto f = std::make_shared<EmulatorSettingsImpl>();
@@ -774,6 +780,7 @@ TEST_F(EmulatorSettingsTest, MigrationKeepsLaterUserChoice) {
     EXPECT_FALSE(f->IsPipelineCacheEnabled());
     EXPECT_EQ(f->GetReadbacksMode(), GpuReadbacksMode::Disabled);
     EXPECT_FALSE(f->IsDirectMemoryAccessEnabled());
+    EXPECT_FALSE(f->IsRedZonePatchingEnabled());
 }
 
 TEST_F(EmulatorSettingsTest, DoubleGlobalLoadIsIdempotent) {

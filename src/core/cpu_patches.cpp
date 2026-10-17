@@ -2198,7 +2198,12 @@ static void PatchUncoveredSSE4aInstructions(u64 segment_addr, const AddressRange
 
 RedZonePatchResult PatchRedZoneMemoryInstructions(u64 segment_addr, u64 segment_size,
                                                   std::span<const uintptr_t> function_starts) {
-    return PatchSegmentStatically(segment_addr, segment_size, function_starts, true, nullptr);
+    AddressRanges covered_ranges;
+    auto result =
+        PatchSegmentStatically(segment_addr, segment_size, function_starts, true, &covered_ranges);
+    // The EH frame search table does not list every function of every module.
+    PatchUncoveredSSE4aInstructions(segment_addr, covered_ranges, result);
+    return result;
 }
 
 RedZonePatchResult PatchCpuInstructionsStatically(u64 segment_addr, u64 segment_size,
@@ -2227,8 +2232,43 @@ RedZonePatchResult PatchCpuInstructionsStatically(u64, u64, std::span<const uint
 // End Windows static guest red-zone protection
 // ============================================================================
 
+namespace {
+
+struct TrapTelemetry {
+    std::atomic<u64> av_jit_patches{0};
+    std::atomic<u64> sigill_jit_patches{0};
+    std::atomic<u64> sigill_short_emulated{0};
+    std::atomic<u64> last_trap_rip{0};
+
+    void ReportIfNeeded(void* rip) noexcept {
+        last_trap_rip.store(reinterpret_cast<u64>(rip), std::memory_order_relaxed);
+        const u64 total = av_jit_patches.load(std::memory_order_relaxed) +
+                          sigill_jit_patches.load(std::memory_order_relaxed) +
+                          sigill_short_emulated.load(std::memory_order_relaxed);
+        if (total == 1 || total == 100 || total % 1000 == 0) {
+            LOG_INFO(Core,
+                     "CPU trap telemetry: {} total (AV JIT={}, SIGILL JIT={}, 4-byte SSE4a "
+                     "emulated={}), last RIP={:#x}",
+                     total, av_jit_patches.load(std::memory_order_relaxed),
+                     sigill_jit_patches.load(std::memory_order_relaxed),
+                     sigill_short_emulated.load(std::memory_order_relaxed),
+                     last_trap_rip.load(std::memory_order_relaxed));
+        }
+    }
+};
+
+TrapTelemetry g_trap_telemetry;
+
+} // namespace
+
 static bool PatchesAccessViolationHandler(void* context, void* /* fault_address */) {
-    return TryPatchJit(Common::GetRip(context));
+    void* code_address = Common::GetRip(context);
+    if (TryPatchJit(code_address)) {
+        g_trap_telemetry.av_jit_patches.fetch_add(1, std::memory_order_relaxed);
+        g_trap_telemetry.ReportIfNeeded(code_address);
+        return true;
+    }
+    return false;
 }
 
 static bool PatchesIllegalInstructionHandler(void* context) {
@@ -2245,7 +2285,12 @@ static bool PatchesIllegalInstructionHandler(void* context) {
         Is4ByteExtrqOrInsertq(code_address)) {
         // The instruction is not big enough for a relative jump, don't try to patch it and pass it
         // to our illegal instruction interpreter directly
-        return TryExecuteIllegalInstruction(context, code_address);
+        if (TryExecuteIllegalInstruction(context, code_address)) {
+            g_trap_telemetry.sigill_short_emulated.fetch_add(1, std::memory_order_relaxed);
+            g_trap_telemetry.ReportIfNeeded(code_address);
+            return true;
+        }
+        return false;
     } else {
         if (!TryPatchJit(code_address)) {
             ZydisDecodedInstruction instruction;
@@ -2264,6 +2309,8 @@ static bool PatchesIllegalInstructionHandler(void* context) {
             }
             return false;
         }
+        g_trap_telemetry.sigill_jit_patches.fetch_add(1, std::memory_order_relaxed);
+        g_trap_telemetry.ReportIfNeeded(code_address);
     }
 
     return true;
