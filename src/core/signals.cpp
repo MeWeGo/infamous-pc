@@ -15,6 +15,7 @@
 #ifdef _WIN32
 #include <windows.h>
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
+static constexpr DWORD CPP_EXCEPTION = 0xE06D7363;
 #else
 #include <csignal>
 #include <pthread.h>
@@ -123,6 +124,9 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     case MS_VC_EXCEPTION:
         LOG_DEBUG(Debug, "Pass MS_VC_EXCEPTION at {} to handler", address);
         return EXCEPTION_EXECUTE_HANDLER;
+    case CPP_EXCEPTION:
+        // C++ exception: allow C++ try/catch handlers to process it.
+        return EXCEPTION_CONTINUE_SEARCH;
     default:
         break;
     }
@@ -141,7 +145,18 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const bool report_unhandled =
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
-        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp && pExp->ExceptionRecord &&
+            pExp->ExceptionRecord->NumberParameters >= 2) {
+            const auto access_type = pExp->ExceptionRecord->ExceptionInformation[0];
+            const auto fault_addr = pExp->ExceptionRecord->ExceptionInformation[1];
+            LOG_CRITICAL(Debug,
+                         "Unhandled Access Violation at {}: attempted to {} address 0x{:x}",
+                         address,
+                         access_type == 1 ? "write to" : (access_type == 8 ? "execute" : "read from"),
+                         fault_addr);
+        } else {
+            LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        }
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

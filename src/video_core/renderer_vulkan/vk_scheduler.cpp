@@ -860,7 +860,8 @@ void Scheduler::SubmitRecorded(const SubmitInfo& info, u64 signal_value) {
         ImGui::Core::TextureManager::Submit();
     }
     auto submit_result = queue.submit(submit_info, info.fence);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Queue submit failed: {}",
+               vk::to_string(submit_result));
     recorded.clear();
 
     submitted_tick.store(signal_value, std::memory_order_release);

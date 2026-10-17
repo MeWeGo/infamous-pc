@@ -4,6 +4,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <utility>
 
 #include "common/types.h"
@@ -47,25 +48,47 @@ struct Bounds {
     u64 end_page;
 };
 
+/// 4096-page bitmap (64 x 64-bit words) covering one 16 MB region.
+/// Shared instances in RegionManager (cpu, gpu, rewritten_now, rewritten_before) are mutated
+/// under RegionManager::mutex and read lock-free by the GPU thread via Load()/Store() using
+/// relaxed std::atomic_ref<u64> to avoid C++ data-race UB and TSan reports.
 struct RegionBits {
-    constexpr void Fill(u64 value) {
-        data.fill(value);
+    constexpr void Fill(u64 value) noexcept {
+        if consteval {
+            data.fill(value);
+        } else {
+            for (u64& word : data) {
+                std::atomic_ref<u64>{word}.store(value, std::memory_order_relaxed);
+            }
+        }
     }
 
-    constexpr bool GetPage(u64 page) const {
-        return data[page / PAGES_PER_WORD] & (1ULL << (page % PAGES_PER_WORD));
+    [[nodiscard]] u64 Load(u64 index) const noexcept {
+        return std::atomic_ref<u64>{data[index]}.load(std::memory_order_relaxed);
     }
 
-    constexpr u64& operator[](u64 index) {
+    void Store(u64 index, u64 value) noexcept {
+        std::atomic_ref<u64>{data[index]}.store(value, std::memory_order_relaxed);
+    }
+
+    constexpr bool GetPage(u64 page) const noexcept {
+        if consteval {
+            return data[page / PAGES_PER_WORD] & (1ULL << (page % PAGES_PER_WORD));
+        } else {
+            return Load(page / PAGES_PER_WORD) & (1ULL << (page % PAGES_PER_WORD));
+        }
+    }
+
+    constexpr u64& operator[](u64 index) noexcept {
         return data[index];
     }
 
-    constexpr u64 operator[](u64 index) const {
+    constexpr u64 operator[](u64 index) const noexcept {
         return data[index];
     }
 
 private:
-    alignas(64) std::array<u64, NUM_REGION_WORDS> data;
+    alignas(64) mutable std::array<u64, NUM_REGION_WORDS> data;
 };
 
 } // namespace VideoCore

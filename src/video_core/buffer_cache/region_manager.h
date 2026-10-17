@@ -147,7 +147,7 @@ public:
         }
         IterateWords(bounds, [&](u64 index, u64 mask) {
             const u64 base_page = index * PAGES_PER_WORD;
-            const u64 word = state[index] & mask;
+            const u64 word = state.Load(index) & mask;
             UpdateStateAndProtection<cpu_op, gpu_op>(write_prot, read_prot, index, mask);
             IteratePages(word, [&](u64 pages_offset, u64 pages_size) {
                 if (end_page == base_page + pages_offset) {
@@ -185,17 +185,17 @@ public:
         const auto [start_word, start_page, end_word, end_page] = GetBounds(offset, size);
         const auto [start_mask, end_mask] = GetMasks(start_page, end_page);
         if (start_word == end_word) [[likely]] {
-            return state[start_word] & (start_mask & end_mask);
+            return state.Load(start_word) & (start_mask & end_mask);
         } else {
-            if (state[start_word] & start_mask) {
+            if (state.Load(start_word) & start_mask) {
                 return true;
             }
             for (s64 i = start_word + 1; i < end_word; ++i) {
-                if (state[i]) {
+                if (state.Load(i)) {
                     return true;
                 }
             }
-            return state[end_word] & end_mask;
+            return state.Load(end_word) & end_mask;
         }
     }
 
@@ -203,7 +203,7 @@ public:
     bool IsRegionFullyCpuModified(u64 offset, u64 size) const noexcept {
         bool full = true;
         IterateWords(GetBounds(offset, size),
-                     [&](u64 index, u64 mask) { full &= (cpu[index] & mask) == mask; });
+                     [&](u64 index, u64 mask) { full &= (cpu.Load(index) & mask) == mask; });
         return full;
     }
 
@@ -211,21 +211,21 @@ public:
     bool IsRegionFullyGpuModified(u64 offset, u64 size) const noexcept {
         bool full = true;
         IterateWords(GetBounds(offset, size),
-                     [&](u64 index, u64 mask) { full &= (gpu[index] & mask) == mask; });
+                     [&](u64 index, u64 mask) { full &= (gpu.Load(index) & mask) == mask; });
         return full;
     }
 
     /// Returns true if pages of a region were newly marked modified from the CPU in the period or
     /// the one before. Read without the lock, so it may miss marks made meanwhile.
     bool IsRegionRewritten(u64 offset, u64 size, u32 period) const noexcept {
-        const u32 marked = rewrite_period.load(std::memory_order_relaxed);
+        const u32 marked = rewrite_period.load(std::memory_order_acquire);
         if (marked != period && marked + 1 != period) {
             return false;
         }
         bool rewritten = false;
         IterateWords(GetBounds(offset, size), [&](u64 index, u64 mask) {
-            const u64 bits =
-                rewritten_now[index] | (marked == period ? rewritten_before[index] : 0);
+            const u64 bits = rewritten_now.Load(index) |
+                             (marked == period ? rewritten_before.Load(index) : 0);
             rewritten |= (bits & mask) != 0;
         });
         return rewritten;
@@ -252,14 +252,16 @@ private:
         const u32 marked = rewrite_period.load(std::memory_order_relaxed);
         if (marked != period) {
             if (marked + 1 == period) {
-                rewritten_before = rewritten_now;
+                for (u64 i = 0; i < NUM_REGION_WORDS; ++i) {
+                    rewritten_before.Store(i, rewritten_now.Load(i));
+                }
             } else {
                 rewritten_before.Fill(0);
             }
             rewritten_now.Fill(0);
-            rewrite_period.store(period, std::memory_order_relaxed);
+            rewrite_period.store(period, std::memory_order_release);
         }
-        rewritten_now[index] |= pages;
+        rewritten_now.Store(index, rewritten_now.Load(index) | pages);
     }
 
     /// Only changed with the lock held, but read without it.
@@ -290,14 +292,11 @@ private:
     void UpdateStateAndProtection(RegionBits& write_prot, RegionBits& read_prot, u64 index,
                                   u64 mask) {
         if constexpr (cpu_op != StateOp::None) {
-            const u64 prev = cpu[index];
-            if constexpr (cpu_op == StateOp::Clear) {
-                cpu[index] &= ~mask;
-            } else {
-                cpu[index] |= mask;
-            }
-            SetWordBit(cpu_words, index, cpu[index] != 0);
-            write_prot[index] = (cpu[index] ^ prev) & mask;
+            const u64 prev = cpu.Load(index);
+            const u64 next = (cpu_op == StateOp::Clear) ? (prev & ~mask) : (prev | mask);
+            cpu.Store(index, next);
+            SetWordBit(cpu_words, index, next != 0);
+            write_prot[index] = (next ^ prev) & mask;
             if constexpr (cpu_op == StateOp::Set) {
                 if (write_prot[index] != 0) {
                     cpu_modified_generation.fetch_add(1, std::memory_order_release);
@@ -306,14 +305,11 @@ private:
             }
         }
         if constexpr (gpu_op != StateOp::None) {
-            const u64 prev = gpu[index];
-            if constexpr (gpu_op == StateOp::Clear) {
-                gpu[index] &= ~mask;
-            } else {
-                gpu[index] |= mask;
-            }
-            SetWordBit(gpu_words, index, gpu[index] != 0);
-            read_prot[index] = (gpu[index] ^ prev) & mask;
+            const u64 prev = gpu.Load(index);
+            const u64 next = (gpu_op == StateOp::Clear) ? (prev & ~mask) : (prev | mask);
+            gpu.Store(index, next);
+            SetWordBit(gpu_words, index, next != 0);
+            read_prot[index] = (next ^ prev) & mask;
         }
     }
 

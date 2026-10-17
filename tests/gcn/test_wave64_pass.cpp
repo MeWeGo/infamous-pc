@@ -196,4 +196,100 @@ TEST_F(Wave64TestFixture, SharedMemoryBarrierSubgroupVsWorkgroup) {
     }
 }
 
+TEST_F(Wave64TestFixture, AtomicsAreLaneVaryingRegardlessOfFlags) {
+    auto no_leaf = [](const Shader::IR::Inst&) { return false; };
+
+    // LDS atomic with is_gds = false (flags == 0) must still be classified as lane-varying
+    const Shader::IR::U32 lds_atomic =
+        Shader::IR::U32{ir.SharedAtomicIAdd(ir.Imm32(0u), ir.Imm32(1u), false)};
+    EXPECT_TRUE(Shader::Optimization::ReachesLaneVaryingSource(lds_atomic, no_leaf));
+
+    // Buffer atomic with zero BufferInstInfo flags must still be classified as lane-varying
+    const Shader::IR::Value buf_atomic =
+        ir.BufferAtomicIAdd(ir.Imm32(0u), ir.Imm32(0u), ir.Imm32(1u), {});
+    EXPECT_TRUE(Shader::Optimization::ReachesLaneVaryingSource(buf_atomic, no_leaf));
+
+    // Image atomic with zero ImageInstInfo flags must still be classified as lane-varying
+    const Shader::IR::Value img_atomic =
+        ir.ImageAtomicIAdd(ir.Imm32(0u), ir.Imm32(0u), ir.Imm32(1u), {});
+    EXPECT_TRUE(Shader::Optimization::ReachesLaneVaryingSource(img_atomic, no_leaf));
+}
+
+TEST_F(Wave64TestFixture, LoopExitingOnLdsAtomicIsDivergent) {
+    Shader::Info info{};
+    info.hw_stage = Shader::HwStage::Compute;
+
+    Shader::IR::Block* loop_body = block_pool.Create(inst_pool);
+    Shader::IR::Block* merge_block = block_pool.Create(inst_pool);
+
+    Shader::IR::IREmitter body_ir{*loop_body};
+    const Shader::IR::U32 old_val =
+        Shader::IR::U32{body_ir.SharedAtomicIAdd(body_ir.Imm32(0u), body_ir.Imm32(1u), false)};
+    const Shader::IR::U1 repeat_cond = body_ir.ILessThan(old_val, body_ir.Imm32(64u), false);
+
+    Shader::IR::Program program{info};
+    program.blocks.push_back(loop_body);
+    program.blocks.push_back(merge_block);
+
+    Shader::IR::AbstractSyntaxNode loop_node{};
+    loop_node.type = Shader::IR::AbstractSyntaxNode::Type::Loop;
+    loop_node.data.loop.body = loop_body;
+    loop_node.data.loop.continue_block = loop_body;
+    loop_node.data.loop.merge = merge_block;
+    program.syntax_list.push_back(loop_node);
+
+    Shader::IR::AbstractSyntaxNode body_node{};
+    body_node.type = Shader::IR::AbstractSyntaxNode::Type::Block;
+    body_node.data.block = loop_body;
+    program.syntax_list.push_back(body_node);
+
+    Shader::IR::AbstractSyntaxNode repeat_node{};
+    repeat_node.type = Shader::IR::AbstractSyntaxNode::Type::Repeat;
+    repeat_node.data.repeat.cond = repeat_cond;
+    repeat_node.data.repeat.loop_header = loop_body;
+    repeat_node.data.repeat.merge = merge_block;
+    program.syntax_list.push_back(repeat_node);
+
+    Shader::IR::AbstractSyntaxNode merge_node{};
+    merge_node.type = Shader::IR::AbstractSyntaxNode::Type::Block;
+    merge_node.data.block = merge_block;
+    program.syntax_list.push_back(merge_node);
+
+    const auto uniform_blocks = Shader::Optimization::FindWave64UniformBlocks(program);
+    EXPECT_EQ(std::ranges::count(uniform_blocks, loop_body), 0);
+    EXPECT_EQ(std::ranges::count(uniform_blocks, merge_block), 1);
+}
+
+TEST_F(Wave64TestFixture, ReadFirstLaneIncludesStaleLdsValidityFallback) {
+    Shader::Info info{};
+    info.hw_stage = Shader::HwStage::Compute;
+
+    Shader::IR::Block test_block{inst_pool};
+    Shader::IR::IREmitter test_ir{test_block};
+    const Shader::IR::U32 lane = test_ir.LaneId();
+    const Shader::IR::U32 rfl = test_ir.ReadFirstLane(lane);
+    const Shader::IR::U32 use = test_ir.IAdd(rfl, test_ir.Imm32(1u));
+
+    Shader::IR::Program program{info};
+    program.blocks.push_back(&test_block);
+    Shader::IR::AbstractSyntaxNode node{};
+    node.type = Shader::IR::AbstractSyntaxNode::Type::Block;
+    node.data.block = &test_block;
+    program.syntax_list.push_back(node);
+
+    Shader::RuntimeInfo runtime_info{};
+    runtime_info.hw.cs.workgroup_size = {64, 1, 1};
+    runtime_info.hw.cs.shared_memory_size = 0;
+
+    Shader::Profile profile{};
+    profile.subgroup_size = 32;
+
+    Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
+
+    // The lowered ReadFirstLane result feeding `use` must be a SelectU32 choosing between the
+    // lower subgroup's LDS value (when valid) and the current subgroup's local ReadFirstLane.
+    ASSERT_FALSE(use.Inst()->Arg(0).IsImmediate());
+    EXPECT_EQ(use.Inst()->Arg(0).Inst()->GetOpcode(), Shader::IR::Opcode::SelectU32);
+}
+
 } // namespace

@@ -246,5 +246,80 @@ TEST(AccessTracker, RemembersRangesPerEpoch) {
     }
 }
 
+TEST(ExactRanges, KeepsByteExactBoundsAndDeduplicatesRecent) {
+    ExactRanges<4> exact;
+    EXPECT_TRUE(exact.Add(100, 124, 1));
+    EXPECT_TRUE(exact.Add(124, 148, 1));
+    // Adjacent 24-byte dispatches do not overlap their neighbors.
+    EXPECT_FALSE(exact.Overlaps(0, 100, 1));
+    EXPECT_TRUE(exact.Overlaps(100, 101, 1));
+    EXPECT_TRUE(exact.Overlaps(123, 125, 1));
+    EXPECT_FALSE(exact.Overlaps(148, 200, 1));
+
+    // Recent duplicate does not consume another slot.
+    EXPECT_TRUE(exact.Add(100, 124, 1));
+    EXPECT_TRUE(exact.Add(200, 210, 1));
+    EXPECT_TRUE(exact.Add(300, 310, 1));
+    // Capacity (4) is now full.
+    EXPECT_FALSE(exact.Add(400, 410, 1));
+
+    // New epoch resets capacity and bounds.
+    EXPECT_FALSE(exact.Overlaps(100, 124, 2));
+    EXPECT_TRUE(exact.Add(400, 410, 2));
+    EXPECT_TRUE(exact.Overlaps(405, 406, 2));
+}
+
+TEST(SessionPages, MatchesPageModelAcrossSmallAndMultiChunkRanges) {
+    std::mt19937_64 rng{4242};
+    constexpr u64 Space = 64 * MB;
+    SessionPages pages;
+    std::vector<std::pair<u64, u64>> marked;
+    u64 session = 1;
+    for (int op = 0; op < 1000; ++op) {
+        const u64 kind = rng() % 100;
+        const u64 start = rng() % (Space - 1);
+        const u64 max_len = (rng() % 4 == 0) ? (24 * MB) : 0x8000;
+        const u64 end = std::min(Space, start + (rng() % max_len) + 1);
+        if (kind < 40) {
+            pages.Add(start, end, session);
+            marked.emplace_back(start, end);
+        } else if (kind < 95) {
+            bool expected = false;
+            for (const auto& [ms, me] : marked) {
+                expected |= (start >> SessionPages::PageBits) <=
+                                ((me - 1) >> SessionPages::PageBits) &&
+                            (ms >> SessionPages::PageBits) <=
+                                ((end - 1) >> SessionPages::PageBits);
+            }
+            ASSERT_EQ(pages.Overlaps(start, end, session), expected);
+        } else {
+            ++session;
+            marked.clear();
+        }
+    }
+}
+
+TEST(InFlightPages, TracksReadAndWriteTicksAcrossWordsAndChunks) {
+    InFlightPages in_flight;
+    constexpr u64 Page = u64{1} << InFlightPages::PageBits;
+    // Small read at tick 5, write at tick 3.
+    in_flight.Add(10 * Page, 12 * Page, 3, true);
+    in_flight.Add(11 * Page, 14 * Page, 5, false);
+
+    EXPECT_EQ(in_flight.LastTick(10 * Page, 11 * Page, 0, false), 3u);
+    EXPECT_EQ(in_flight.LastTick(11 * Page, 12 * Page, 0, false), 5u);
+    EXPECT_EQ(in_flight.LastTick(11 * Page, 12 * Page, 0, true), 3u);
+    EXPECT_EQ(in_flight.LastTick(11 * Page, 12 * Page, 3, true), 0u);
+    EXPECT_EQ(in_flight.LastTick(11 * Page, 12 * Page, 3, false), 5u);
+
+    // Multi-word range covering whole intermediate words (chunks).
+    in_flight.Add(100 * Page, 300 * Page, 10, true);
+    in_flight.Add(150 * Page, 250 * Page, 12, false);
+    EXPECT_EQ(in_flight.LastTick(200 * Page, 201 * Page, 9, true), 10u);
+    EXPECT_EQ(in_flight.LastTick(200 * Page, 201 * Page, 10, true), 0u);
+    EXPECT_EQ(in_flight.LastTick(200 * Page, 201 * Page, 10, false), 12u);
+}
+
 } // Anonymous namespace
 } // namespace VideoCore
+

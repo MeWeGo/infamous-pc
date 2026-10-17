@@ -398,23 +398,27 @@ bool Instance::CreateDevice() {
         return false;
     }
 
-    // A second queue in the same family runs compute work beside the graphics work
-    // without queue family ownership transfers. Falls back to no second queue.
+    // A second queue of the family runs the work of the game's compute rings beside the graphics
+    // work, if asked for. Queues of one family share resources without transfers of ownership.
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f};
+    const u32 available_queues = family_properties[queue_family_index].queueCount;
+    const bool second_queue = EmulatorSettings.IsAsyncCompute() && available_queues > 1;
+    const u32 next_queue_index = second_queue ? 2u : 1u;
+
+    // A dedicated queue in the same family runs compute/readback work beside the graphics work
+    // without queue family ownership transfers. Falls back to no dedicated queue if all available
+    // queues in the family are already claimed.
     compute_queue_family_index = ~0u;
     u32 compute_queue_index = 0;
-    if (family_properties[queue_family_index].queueCount >= 2) {
+    if (available_queues > next_queue_index) {
         compute_queue_family_index = queue_family_index;
-        compute_queue_index = 1;
+        compute_queue_index = next_queue_index;
     }
     compute_queue_index_ = compute_queue_index;
 
-    // A second queue of the family runs the work of the game's compute rings beside the graphics
-    // work, if asked for. Queues of one family share resources without transfers of ownership.
-    static constexpr std::array queue_priorities = {1.0f, 1.0f};
-    const bool second_queue =
-        EmulatorSettings.IsAsyncCompute() && family_properties[queue_family_index].queueCount > 1;
     const u32 graphics_queue_count =
-        (compute_queue_family_index == queue_family_index || second_queue) ? 2u : 1u;
+        (compute_queue_family_index == queue_family_index) ? (compute_queue_index + 1u)
+                                                           : (second_queue ? 2u : 1u);
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
         .queueCount = graphics_queue_count,

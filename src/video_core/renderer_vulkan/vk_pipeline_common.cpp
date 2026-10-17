@@ -27,6 +27,7 @@ void Pipeline::CancelCompile() noexcept {
     if (compile_job) {
         compile_job->Cancel();
     }
+    std::scoped_lock lock{optimize_mutex};
     if (optimize_job) {
         optimize_job->Cancel();
     }
@@ -34,12 +35,12 @@ void Pipeline::CancelCompile() noexcept {
 
 void Pipeline::SwapInOptimized() const {
     optimize_job.reset();
-    if (!optimized_pipeline) {
-        return;
+    if (optimized_pipeline) {
+        // Commands recorded so far may still use the old one.
+        scheduler.DeferOperation([old = std::move(pipeline)]() mutable { old.reset(); });
+        pipeline = std::move(optimized_pipeline);
     }
-    // Commands recorded so far may still use the old one.
-    scheduler.DeferOperation([old = std::move(pipeline)]() mutable { old.reset(); });
-    pipeline = std::move(optimized_pipeline);
+    has_optimize_job.store(false, std::memory_order_release);
 }
 
 void Pipeline::WaitReady() const {

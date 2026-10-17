@@ -80,7 +80,8 @@ u64 ComputeQueue::Submit(std::span<const std::pair<vk::Semaphore, u64>> waits) {
 
     std::scoped_lock lock{submit_mutex};
     const auto submit_result = queue.submit(submit_info, nullptr);
-    ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during compute submit");
+    ASSERT_MSG(submit_result == vk::Result::eSuccess, "Compute queue submit failed: {}",
+               vk::to_string(submit_result));
     current = vk::CommandBuffer{};
     last_tick = signal_value;
     reserved_tick = 0;

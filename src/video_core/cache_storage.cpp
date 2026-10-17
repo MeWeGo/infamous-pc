@@ -42,10 +42,12 @@ constexpr u64 MaxCacheSize = 2_GB;
 u64 DirectorySize(const std::filesystem::path& path) {
     std::error_code ec;
     u64 size{};
-    for (const auto& entry : std::filesystem::directory_iterator{path, ec}) {
-        if (entry.is_regular_file(ec)) {
-            size += entry.file_size(ec);
+    std::filesystem::directory_iterator it{path, ec};
+    while (!ec && it != std::filesystem::directory_iterator{}) {
+        if (it->is_regular_file(ec)) {
+            size += it->file_size(ec);
         }
+        it.increment(ec);
     }
     return size;
 }
@@ -56,32 +58,30 @@ void ProcessIO(const std::stop_token& stoken) {
     Common::SetCurrentThreadName("shadPS4:PipelineCacheIO");
 
     while (!stoken.stop_requested()) {
+        std::packaged_task<void()> request{};
         {
             std::unique_lock lk{submit_mutex};
             Common::CondvarWait(request_cv, lk, stoken, [&] { return num_requests; });
-        }
-
-        if (stoken.stop_requested()) {
-            break;
-        }
-
-        while (num_requests) {
-            std::packaged_task<void()> request{};
+            if (stoken.stop_requested()) {
+                break;
+            }
             {
                 std::scoped_lock lock{m_request};
-                if (req_queue.empty()) {
-                    continue;
+                if (!req_queue.empty()) {
+                    request = std::move(req_queue.front());
+                    req_queue.pop();
                 }
-                request = std::move(req_queue.front());
-                req_queue.pop();
             }
+            if (num_requests > 0) {
+                --num_requests;
+            }
+        }
 
-            if (request.valid()) {
+        if (request.valid()) {
+            try {
                 request();
-                request.get_future().wait();
+            } catch (...) {
             }
-
-            --num_requests;
         }
     }
 }
@@ -159,9 +159,8 @@ void DataBase::Clear() {
         mz_zip_zero_struct(&zip_ar);
         mz_zip_writer_init_file(&zip_ar, cache_path.string().c_str(), 0);
     } else {
-        for (const auto& entry : std::filesystem::directory_iterator{cache_path, ec}) {
-            std::filesystem::remove(entry.path(), ec);
-        }
+        std::filesystem::remove_all(cache_path, ec);
+        std::filesystem::create_directories(cache_path, ec);
     }
     if (ec) {
         LOG_WARNING(Render, "Failed to clear the cache at {}: {}", cache_path.string(),
@@ -294,16 +293,19 @@ void DataBase::ForEachBlob(BlobType type, const std::function<void(std::vector<u
             }
         }
     } else {
-        for (const auto& file_name : std::filesystem::directory_iterator{cache_path}) {
-            if (file_name.path().extension().string().ends_with(ext)) {
+        std::error_code ec;
+        std::filesystem::directory_iterator it{cache_path, ec};
+        while (!ec && it != std::filesystem::directory_iterator{}) {
+            if (it->path().extension().string().ends_with(ext)) {
                 using namespace Common::FS;
-                const auto& file = IOFile{file_name, FileAccessMode::Read};
+                const auto& file = IOFile{it->path(), FileAccessMode::Read};
                 if (file.IsOpen()) {
                     std::vector<u8> data(file.GetSize());
                     file.Read(data);
                     func(std::move(data));
                 }
             }
+            it.increment(ec);
         }
     }
 }

@@ -100,7 +100,9 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
         [this](u64 tick) { return compute_queue.IsFree(tick); });
     // The second queue doubles as the readback queue: copies of GPU modified
     // memory wait for the submission that wrote it, not the whole timeline.
-    buffer_cache.SetReadbackQueue(&compute_queue);
+    if (compute_queue.IsAvailable()) {
+        buffer_cache.SetReadbackQueue(&compute_queue);
+    }
     // A readback of memory the compute batch writes needs the batch submitted
     // first: its results aren't in the queue until then.
     buffer_cache.SetComputeBatchFlusher([this]() { SubmitComputeBatch(); });
@@ -704,6 +706,7 @@ void Rasterizer::SubmitComputeBatch() {
     // (sparse binds up to then). Its own earlier batches chain automatically.
     std::vector<std::pair<vk::Semaphore, u64>> waits;
     if (compute_batch_graphics_tick > 0) {
+        scheduler.WaitSubmitted(compute_batch_graphics_tick);
         waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(),
                            compute_batch_graphics_tick);
     }
@@ -747,7 +750,8 @@ void Rasterizer::FlushGraphicsForCompute() {
 
 std::vector<std::pair<vk::Semaphore, u64>> Rasterizer::ComputeSubmitWaits() {
     std::vector<std::pair<vk::Semaphore, u64>> waits;
-    if (const u64 current = scheduler.CurrentTick(); current > 0) {
+    if (const u64 current = scheduler.CurrentTick(); current > 1) {
+        scheduler.WaitSubmitted(current - 1);
         waits.emplace_back(scheduler.GetWorkSemaphore()->Handle(), current - 1);
     }
     if (const auto [sema, tick] = buffer_cache.MemoryFence(); sema && tick != 0) {

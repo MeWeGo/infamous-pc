@@ -32,6 +32,14 @@
 
 #ifdef __APPLE__
 #include <SDL3/SDL_metal.h>
+#elif defined(_WIN32)
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
 #endif
 #include <core/emulator_settings.h>
 #include "core/libraries/keyboard/keyboard.h"
@@ -160,12 +168,20 @@ WindowSDL::WindowSDL(s32 width_, s32 height_, Input::GameControllers* controller
     // the cached size so the first swapchain and the splashscreen use the real drawable size.
     SDL_GetWindowSizeInPixels(window, &width, &height);
 
+    SDL_ShowWindow(window);
+    SDL_RaiseWindow(window);
+
     SDL_InitSubSystem(SDL_INIT_GAMEPAD);
 
 #if defined(SDL_PLATFORM_WIN32)
     window_info.type = WindowSystemType::Windows;
     window_info.render_surface = SDL_GetPointerProperty(SDL_GetWindowProperties(window),
                                                         SDL_PROP_WINDOW_WIN32_HWND_POINTER, NULL);
+    if (window_info.render_surface) {
+        HWND hwnd = static_cast<HWND>(window_info.render_surface);
+        ShowWindow(hwnd, SW_SHOWNORMAL);
+        SetForegroundWindow(hwnd);
+    }
 #elif defined(SDL_PLATFORM_LINUX) || defined(__FreeBSD__)
     // SDL doesn't have a platform define for FreeBSD AAAAAAAAAA
     if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "x11") == 0) {

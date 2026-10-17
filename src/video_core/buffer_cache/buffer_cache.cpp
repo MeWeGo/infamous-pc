@@ -483,7 +483,8 @@ std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_a
     // deadlock, so those fall back to the graphics timeline. A write on the
     // compute queue is always from a submitted batch (the flusher above): the
     // copy on the same queue executes after it in order.
-    const bool use_queue = readback_queue != nullptr && last_write_tick > 0 &&
+    const bool use_queue = readback_queue != nullptr && readback_queue->IsAvailable() &&
+                           last_write_tick > 0 &&
                            (last_write_on_compute ||
                             last_write_tick < scheduler.CurrentTick());
     auto readback = RecordReadback(arena, window_start, window_end, !use_queue);
@@ -520,6 +521,7 @@ std::shared_ptr<BufferCache::Readback> BufferCache::StartReadback(VAddr device_a
             // No graphics wait: last_write_tick is on the compute timeline.
             readback->tick = readback_queue->Submit({});
         } else {
+            scheduler.WaitSubmitted(last_write_tick);
             const std::pair<vk::Semaphore, u64> gfx_wait{
                 scheduler.GetWorkSemaphore()->Handle(), last_write_tick};
             readback->tick = readback_queue->Submit({&gfx_wait, 1});

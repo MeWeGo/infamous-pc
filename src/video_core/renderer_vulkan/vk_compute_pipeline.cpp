@@ -155,8 +155,10 @@ ComputePipeline::ComputePipeline(const Instance& instance, Scheduler& scheduler,
     } else if (cache_control) {
         // Otherwise one built without optimizations, which is quicker on some drivers, is used
         // now, and the optimized one replaces it once a compiler thread has it.
-        optimize_job = compiler->Submit([this, create] { optimized_pipeline = create({}); });
         pipeline = create(vk::PipelineCreateFlagBits::eDisableOptimization);
+        std::scoped_lock lock{optimize_mutex};
+        optimize_job = compiler->Submit([this, create] { optimized_pipeline = create({}); });
+        has_optimize_job.store(true, std::memory_order_release);
     } else {
         pipeline = create({});
     }

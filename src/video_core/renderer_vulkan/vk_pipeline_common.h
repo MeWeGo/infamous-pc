@@ -3,8 +3,10 @@
 
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string_view>
 
 #include "shader_recompiler/profile.h"
@@ -40,8 +42,12 @@ public:
     /// Returns the pipeline to bind, waiting for it to finish compiling if needed.
     vk::Pipeline Handle() const {
         WaitReady();
-        if (optimize_job && optimize_job->IsDone()) {
-            SwapInOptimized();
+        if (has_optimize_job.load(std::memory_order_acquire)) {
+            std::scoped_lock lock{optimize_mutex};
+            if (optimize_job && optimize_job->IsDone()) {
+                SwapInOptimized();
+            }
+            return *pipeline;
         }
         return *pipeline;
     }
@@ -126,6 +132,8 @@ protected:
     std::shared_ptr<PipelineCompileJob> compile_job;
     /// Builds the optimized pipeline into optimized_pipeline, to replace one built without
     /// optimizations to be used at once.
+    mutable std::mutex optimize_mutex;
+    mutable std::atomic<bool> has_optimize_job{false};
     mutable std::shared_ptr<PipelineCompileJob> optimize_job;
     mutable vk::UniquePipeline optimized_pipeline;
     bool preloaded{};

@@ -425,6 +425,7 @@ target_compile_definitions(shadps4_region_manager_test PRIVATE BOOST_ASIO_STANDA
 
 target_link_libraries(shadps4_region_manager_test PRIVATE
     GTest::gtest_main
+    Boost::headers
     fmt::fmt
     nlohmann_json::nlohmann_json
     toml11::toml11

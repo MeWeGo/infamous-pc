@@ -357,7 +357,13 @@ void PipelineCache::WarmUp() {
         if (!profile_data.empty()) {
             LOG_INFO(Render, "Pipeline cache was made by another emulator build or GPU, "
                              "rebuilding it");
-            Storage::DataBase::Instance().Clear();
+            try {
+                Storage::DataBase::Instance().Clear();
+            } catch (const std::exception& e) {
+                LOG_WARNING(Render, "Failed to clear pipeline cache: {}", e.what());
+            } catch (...) {
+                LOG_WARNING(Render, "Failed to clear pipeline cache: unknown error");
+            }
         }
         Storage::DataBase::Instance().FinishPreload();
 

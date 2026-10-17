@@ -1,5 +1,10 @@
 **Yenilikler**
 
-- Düzeltildi: PS4 Pro modu (ayarlarda **Enable PS4 Neo Mode**, config'te `neo_mode`) inFAMOUS Second Son'da çalışıyor. Açıkken oyun 19. saniye civarında kapanıyordu; o düzeltilince de renkli piksel gürültüsüyle dolu yeşil bir görüntü veriyordu. Pro modunda oyun sahneyi 1600x1800'de dama tahtası (checkerboard) düzeninde çiziyor ve bir compute shader diğer yarıyı dolduruyor; renkleri seçerken kullandığı karşılaştırmalar emülatörde sonuçlarını yanlış yazmaçlara yazıyordu. Oyun artık 3840x2160 çıktıda keskin bir görüntü veriyor. Pro modu kare hızını değil çözünürlüğü artırır: aşağıdaki test makinesinde açıkken 67.4, kapalıyken 74.2 FPS (her biri üç turun ortalaması); ekran kartı %78-81 yerine %87-93 meşgul. Çit gibi ince geometri biraz tırtıklı görünebilir.
-- Emülatörün ürettiği shader'lar değiştiği için güncellemeden sonra shader cache bir kez yeniden oluşturulur: efektler ilk göründüğünde biraz takılma olabilir.
-- RTX 5080 ve Ryzen 7 9800X3D'de, Seattle'daki parkta dururken, emülatör yüksek öncelikte, sırayla ölçüldü; işlemcinin %4-9'unu başka programlar kullanıyordu.
+- **3D Görevlerde Çökme Düzeltildi (SRT Walker Overrun)**: SRT walker sinyal işleyicisindeki (`flatten_extended_userdata_pass.cpp`) tampon sınır hesaplama hatası ve decode uzunluğu düzeltilerek 3D oyun dünyasına ve görevlere geçişte oluşan bellek erişim ihlali (access violation) giderildi.
+- **Pencere Görünürlüğü ve Ekran Odaklanması**: SDL penceresi oluşturulurken pencere zorla görünür kılınarak ve ön plana getirilerek miras alınan `SW_HIDE` durumlarında pencerenin gizli kalması engellendi.
+- **Tek Kuyruklu Cihazlarda Readback Çökmesi Düzeltildi**: Readback kuyruk kaydı `IsAvailable()` kontrolüne bağlanarak tek kuyruklu grafik kartlarında null kuyruk çökmeleri önlendi.
+- **Wave64 Atomik Tekdüzelik ve LDS Bayatlık Düzeltmesi**: Atomik komutlar için lane-uniform sınıflandırması düzeltilerek döngü kilitlenmeleri engellendi; `ReadFirstLane` içindeki eski LDS geçerlilik bayrağı temizlendi.
+- **Buffer Cache Veri Yarışması Giderildi**: `RegionBits` okuma ve yazma işlemleri atomik hale getirilerek thread-safety sağlandı.
+- **Async Compute Kuyruk İndeksi Çakışması Düzeltildi**: Hem async hem standart compute kuyruğu etkinken indeks 1 üzerinde oluşan çakışma giderildi.
+- **Pipeline Eşzamanlılığı**: `Handle()` ve `SwapInOptimized()` fonksiyonları mutex ile korunarak pipeline yarışmaları önlendi.
+- **CacheStorage ve Sinyal Yönetimi Düzeltildi**: Boş cache dizini silme çökmeleri ve Windows sinyal işleyicisindeki C++ istisna (`0xE06D7363`) hatası düzeltildi.

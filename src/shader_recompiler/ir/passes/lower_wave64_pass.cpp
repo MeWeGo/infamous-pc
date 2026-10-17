@@ -26,12 +26,13 @@ bool IsLaneVaryingSource(const IR::Inst& inst) {
                attr == IR::Attribute::SubgroupLtMask;
     }
     default: {
-        // Atomic ops returning the old value produce a distinct result per participating lane.
+        // Any atomic op whose result is consumed returns the per-lane old value.
+        // Note: inst.Flags encodes GDS / BufferAtomicFlags / ImageAtomicFlags, not return semantics.
         const auto op = inst.GetOpcode();
         if ((op >= IR::Opcode::SharedAtomicIAdd32 && op <= IR::Opcode::SharedAtomicCmpSwap64) ||
             (op >= IR::Opcode::BufferAtomicIAdd32 && op <= IR::Opcode::BufferAtomicFCmpSwap32) ||
             (op >= IR::Opcode::ImageAtomicIAdd32 && op <= IR::Opcode::ImageAtomicCmpSwap32)) {
-            return inst.Flags<bool>();
+            return true;
         }
         return false;
     }
@@ -292,6 +293,18 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     std::vector<IR::Inst*> worklist;
     std::vector<IR::Inst*> divergent_ballots;
     const auto uniform_blocks = FindWave64UniformBlocks(program);
+    const auto is_uniform_in_blocks = [&](const IR::Value& val) {
+        if (val.IsImmediate()) {
+            return true;
+        }
+        return !ReachesLaneVaryingSource(val, [&](const IR::Inst& leaf) {
+            const bool is_rfl = leaf.GetOpcode() == IR::Opcode::ReadFirstLane;
+            const bool is_rl =
+                leaf.GetOpcode() == IR::Opcode::ReadLane && leaf.Arg(1).IsImmediate();
+            return (is_rfl || is_rl) && std::ranges::contains(uniform_blocks, leaf.GetParent());
+        });
+    };
+    bool has_read_first_lane = false;
     for (IR::Block* block : program.blocks) {
         const bool is_uniform = std::ranges::contains(uniform_blocks, block);
         const auto push_worklist = [&](IR::Inst& inst) {
@@ -306,8 +319,9 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             if (inst.GetOpcode() == IR::Opcode::ReadLane && inst.Arg(1).IsImmediate()) {
                 push_worklist(inst);
             } else if (inst.GetOpcode() == IR::Opcode::ReadFirstLane && is_uniform &&
-                       (has_lane_math || !IsProvablyWaveUniform(inst.Arg(0)))) {
+                       (has_lane_math || !is_uniform_in_blocks(inst.Arg(0)))) {
                 worklist.push_back(&inst);
+                has_read_first_lane = true;
             } else if (inst.GetOpcode() == IR::Opcode::Ballot) {
                 const auto is_unpack = [](const IR::Use& use) {
                     return use.user->GetOpcode() == IR::Opcode::UnpackUint2x32;
@@ -357,8 +371,24 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
     const u32 scratch_base = Common::AlignUp(runtime_info.hw.cs.shared_memory_size, sizeof(u64));
     const u32 scratch_size =
         (Common::AlignUp(num_threads, 64) / profile.subgroup_size) * sizeof(u32);
+    const u32 flag_base = scratch_base + scratch_size;
+    const u32 total_scratch = has_read_first_lane ? scratch_size * 2 : scratch_size;
     program.info.shared_memory_scratch_size =
-        scratch_base + scratch_size - runtime_info.hw.cs.shared_memory_size;
+        scratch_base + total_scratch - runtime_info.hw.cs.shared_memory_size;
+
+    if (has_read_first_lane && !program.blocks.empty()) {
+        IR::Block* const entry = program.blocks.front();
+        auto insert_it = std::ranges::find_if_not(entry->Instructions(), [](const IR::Inst& i) {
+            return IR::IsPhi(i) || i.GetOpcode() == IR::Opcode::Prologue;
+        });
+        IR::IREmitter entry_ir{*entry, insert_it};
+        const IR::U32 inv_idx = entry_ir.GetAttributeU32(IR::Attribute::LocalInvocationIndex);
+        const IR::U32 sg_id = entry_ir.ShiftRightLogical(inv_idx, entry_ir.Imm32(5));
+        const IR::U32 init_flag_offset =
+            entry_ir.IAdd(entry_ir.Imm32(flag_base),
+                          entry_ir.ShiftLeftLogical(sg_id, entry_ir.Imm32(2u)));
+        entry_ir.WriteShared(32, entry_ir.Imm32(0u), init_flag_offset);
+    }
 
     for (IR::Inst* inst : worklist) {
         LOG_INFO(Render_Recompiler, "Lowering {} instruction for wave64", inst->GetOpcode());
@@ -389,14 +419,25 @@ void LowerWave64BallotPass(IR::Program& program, const RuntimeInfo& runtime_info
             ir.Barrier();
             inst->ReplaceUsesWithAndRemove(value);
         } else if (inst->GetOpcode() == IR::Opcode::ReadFirstLane) {
-            // In uniform control flow EXEC has bit 0 set, so GCN v_readfirstlane_b32 reads wave64
-            // lane 0 (the lower wave32 subgroup's lane 0).
-            const IR::U32 offset =
-                ir.IAdd(ir.Imm32(scratch_base), ir.ShiftLeftLogical(subgroup_id, ir.Imm32(2u)));
-            ir.WriteShared(32, ir.ReadFirstLane(IR::U32{inst->Arg(0)}), offset);
+            // In uniform control flow EXEC normally has a lower-half lane active, so GCN
+            // v_readfirstlane_b32 reads the lower wave32 subgroup's first active lane. If all
+            // lower-half lanes are masked off, lo_valid stays 0 and the upper subgroup falls back
+            // to its own ReadFirstLane rather than reading a stale value left in LDS by an earlier
+            // operation.
+            const IR::U32 local_rfl = ir.ReadFirstLane(IR::U32{inst->Arg(0)});
+            const IR::U32 sg_byte_offset = ir.ShiftLeftLogical(subgroup_id, ir.Imm32(2u));
+            const IR::U32 offset = ir.IAdd(ir.Imm32(scratch_base), sg_byte_offset);
+            const IR::U32 flag_offset = ir.IAdd(ir.Imm32(flag_base), sg_byte_offset);
+            ir.WriteShared(32, local_rfl, offset);
+            ir.WriteShared(32, ir.Imm32(1u), flag_offset);
             ir.Barrier();
-            const IR::U32 value =
+            const IR::U32 lo_rfl =
                 IR::U32{ir.LoadShared(32, false, ir.BitwiseAnd(offset, ir.Imm32(~7u)))};
+            const IR::U32 lo_valid =
+                IR::U32{ir.LoadShared(32, false, ir.BitwiseAnd(flag_offset, ir.Imm32(~7u)))};
+            const IR::U32 value =
+                IR::U32{ir.Select(ir.INotEqual(lo_valid, ir.Imm32(0u)), lo_rfl, local_rfl)};
+            ir.WriteShared(32, ir.Imm32(0u), flag_offset);
             ir.Barrier();
             inst->ReplaceUsesWithAndRemove(value);
         } else if (inst->GetOpcode() == IR::Opcode::MaskedBitCount32) {
