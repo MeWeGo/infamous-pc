@@ -816,11 +816,18 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
         });
         stream->Publish(true);
     } else {
+        // A non-streamed scheduler is only recorded and submitted on a single owning thread,
+        // so no other thread can advance NextTick() or submit on this scheduler while the lock
+        // is released. We release queue_mutex across host work and cross-scheduler waits so other
+        // submitters sharing this queue are not blocked, then re-acquire it around SubmitRecorded.
+        lk.unlock();
         WaitHostWork(host_work);
         if (info.submitted_first) {
             info.submitted_first->WaitSubmitted(info.submitted_first_tick);
         }
+        lk.lock();
         SubmitRecorded(info, signal_value);
+        lk.unlock();
     }
 
     work_semaphore.Refresh();

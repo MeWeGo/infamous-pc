@@ -7,6 +7,7 @@
 
 #include "common/assert.h"
 #include "common/debug.h"
+#include "common/tuning.h"
 #include "common/types.h"
 #include "core/emulator_settings.h"
 #include "imgui/renderer/imgui_core.h"
@@ -400,7 +401,7 @@ bool Instance::CreateDevice() {
 
     // A second queue of the family runs the work of the game's compute rings beside the graphics
     // work, if asked for. Queues of one family share resources without transfers of ownership.
-    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f};
+    static constexpr std::array queue_priorities = {1.0f, 1.0f, 1.0f, 1.0f};
     const u32 available_queues = family_properties[queue_family_index].queueCount;
     const bool second_queue = EmulatorSettings.IsAsyncCompute() && available_queues > 1;
     const u32 next_queue_index = second_queue ? 2u : 1u;
@@ -416,9 +417,24 @@ bool Instance::CreateDevice() {
     }
     compute_queue_index_ = compute_queue_index;
 
-    const u32 graphics_queue_count =
+    const u32 next_present_index =
         (compute_queue_family_index == queue_family_index) ? (compute_queue_index + 1u)
-                                                           : (second_queue ? 2u : 1u);
+                                                           : next_queue_index;
+
+    // Reserve a dedicated queue for swapchain presentation if supported and enabled, so present
+    // calls do not block the graphics queue and GPU thread.
+    static const bool tune_separate_present =
+        Common::Tune("SHAD_SEPARATE_PRESENT_QUEUE", 1) != 0;
+    separate_present_queue = false;
+    present_queue_index_ = 0;
+    if (tune_separate_present && available_queues > next_present_index) {
+        separate_present_queue = true;
+        present_queue_index_ = next_present_index;
+    }
+
+    const u32 graphics_queue_count =
+        separate_present_queue ? (present_queue_index_ + 1u) : next_present_index;
+
     const vk::DeviceQueueCreateInfo queue_info = {
         .queueFamilyIndex = queue_family_index,
         .queueCount = graphics_queue_count,
@@ -641,7 +657,9 @@ bool Instance::CreateDevice() {
     VULKAN_HPP_DEFAULT_DISPATCHER.init(*device);
 
     graphics_queue = device->getQueue(queue_family_index, 0);
-    present_queue = device->getQueue(queue_family_index, 0);
+    present_queue = device->getQueue(queue_family_index, present_queue_index_);
+    LOG_INFO(Render_Vulkan, "Present queue: family {} index {}", queue_family_index,
+             present_queue_index_);
     if (compute_queue_family_index != ~0u) {
         compute_queue = device->getQueue(compute_queue_family_index, compute_queue_index_);
         LOG_INFO(Render_Vulkan, "Compute queue: family {} index {}", compute_queue_family_index,

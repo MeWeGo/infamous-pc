@@ -89,6 +89,10 @@ public:
         return present_queue;
     }
 
+    bool HasSeparatePresentQueue() const {
+        return separate_present_queue;
+    }
+
     /// Returns the second queue of the graphics family the game's compute rings run on, or null.
     vk::Queue GetAsyncQueue() const {
         return async_queue;
@@ -526,6 +530,8 @@ private:
     std::string vendor_name;
     VmaAllocator allocator{};
     vk::Queue present_queue;
+    u32 present_queue_index_{0};
+    bool separate_present_queue{false};
     vk::Queue async_queue;
     vk::Queue graphics_queue;
     vk::Queue compute_queue{};

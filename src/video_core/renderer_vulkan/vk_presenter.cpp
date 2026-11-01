@@ -1082,9 +1082,15 @@ void Presenter::Present(Frame* frame, bool is_reusing_frame, bool is_game_frame)
     info.AddSignal(frame->present_done);
     scheduler.Flush(info);
 
-    // Present to swapchain.
+    // Present to swapchain. On a queue of its own, presenting doesn't hold the graphics queue's
+    // lock, which the GPU thread and the recording thread wait on to submit. The present waits on
+    // present_ready, which a queue can only do once its signal was submitted: the present
+    // scheduler records on this thread, so the Flush above submitted it before returning.
+    ASSERT(!scheduler.RecordsOnThread());
+    static std::mutex present_queue_mutex;
     {
-        std::scoped_lock submit_lock{Scheduler::submit_mutex};
+        std::scoped_lock submit_lock{instance.HasSeparatePresentQueue() ? present_queue_mutex
+                                                                        : Scheduler::submit_mutex};
         if (!swapchain.Present()) {
             swapchain.Recreate(window.GetWidth(), window.GetHeight());
         }

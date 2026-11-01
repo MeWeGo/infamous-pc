@@ -123,7 +123,9 @@ void Initialize(const ::Vulkan::Instance& instance, const Frontend::WindowSDL& w
         .physical_device = instance.GetPhysicalDevice(),
         .device = instance.GetDevice(),
         .queue_family = instance.GetPresentQueueFamilyIndex(),
-        .queue = instance.GetPresentQueue(),
+        // ImGui submits its uploads under the graphics queue's lock, so it keeps that queue even
+        // when presentation has a queue of its own.
+        .queue = instance.GetGraphicsQueue(),
         .image_count = image_count,
         .min_allocation_size = 1024 * 1024,
         .pipeline_rendering_create_info{
