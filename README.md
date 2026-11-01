@@ -30,7 +30,7 @@ SPDX-License-Identifier: GPL-2.0-or-later
 
 ## What is this?
 
-`infamous-pc` runs **inFAMOUS Second Son** (CUSA00223, update 1.07) and **inFAMOUS First Light** on Windows through a [shadPS4](https://github.com/shadps4-emu/shadPS4) fork whose only goal is **speed and stability on these games**. Everything in the render path — buffer cache, readbacks, upload threads, pipeline compilation — is profiled against inFAMOUS and tuned for it, not for the average PS4 title.
+`infamous-pc` runs **inFAMOUS Second Son** (CUSA00223, update 1.07) on Windows through a [shadPS4](https://github.com/shadps4-emu/shadPS4) fork whose only goal is **speed and stability on this game**. Everything in the render path — buffer cache, readbacks, upload threads, pipeline compilation — is profiled against inFAMOUS and tuned for it, not for the average PS4 title.
 
 > [!NOTE]
 > No game files are included. You need your own dump of the game (base + update 1.07 merged in one folder) and system modules (`sys_modules`) from your own PS4. Bugs and glitches remain; this is a performance-first build.
